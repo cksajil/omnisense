@@ -1,4 +1,6 @@
-# 🎬 OmniSense — Multimodal AI Media Analyzer
+# 🎬 OmniSense
+
+[![HuggingFace Spaces](https://img.shields.io/badge/🤗-Live%20Demo-yellow)](https://huggingface.co/spaces/sajilck/omnisense) — Multimodal AI Media Analyzer
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace-yellow)](https://huggingface.co/)
