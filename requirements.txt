@@ -1,0 +1,46 @@
+# Core ML
+torch
+torchvision
+torchaudio
+transformers
+datasets
+huggingface-hub
+accelerate
+sentencepiece
+tokenizers
+
+# Audio
+openai-whisper
+ffmpeg-python
+
+# Vision
+Pillow
+opencv-python-headless
+pytube
+
+# NLP utilities
+spacy
+
+# Vector search
+faiss-cpu
+sentence-transformers
+
+# API & UI
+fastapi
+uvicorn[standard]
+gradio
+python-multipart
+
+# Dev & testing
+pytest
+pytest-cov
+ruff
+pre-commit
+
+# Utilities
+python-dotenv
+loguru
+tqdm
+numpy
+pandas
+pydantic
