@@ -1,6 +1,5 @@
 # 🎬 OmniSense
 
-[![HuggingFace Spaces](https://img.shields.io/badge/🤗-Live%20Demo-yellow)](https://huggingface.co/spaces/sajilck/omnisense) — Multimodal AI Media Analyzer
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![HuggingFace](https://img.shields.io/badge/🤗-HuggingFace-yellow)](https://huggingface.co/)
@@ -10,6 +9,11 @@
 > An end-to-end multimodal AI pipeline that analyzes video and audio using 6+ open-source HuggingFace models — transcription, summarization, NER, image captioning, object detection, and semantic search — all in a single interactive dashboard.
 
 ---
+
+[![HuggingFace Spaces](https://img.shields.io/badge/🤗-Live%20Demo-yellow)](https://huggingface.co/spaces/sajilck/omnisense)
+
+[![OmniSense Live Demo](assets/ui.png)](https://huggingface.co/spaces/sajilck/omnisense)
+
 
 ## ✨ Features
 
