@@ -28,7 +28,7 @@ DEVICE: str = os.getenv("DEVICE", "cpu")  # "cuda" | "mps" | "cpu"
 # ── Model identifiers (single source of truth) ────────────────────────────────
 MODELS = {
     "whisper": "openai/whisper-base",
-    "summarizer": "facebook/bart-large-cnn",
+    "summarizer": "sshleifer/distilbart-cnn-6-6",
     "classifier": "facebook/bart-large-mnli",
     "ner": "dslim/bert-base-NER",
     "captioner": "Salesforce/blip-image-captioning-base",
