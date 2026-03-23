@@ -27,6 +27,19 @@ from omnisense.pipelines.base import BasePipeline
 from omnisense.utils.logger import log
 
 
+class _NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles NumPy scalar types."""
+
+    def default(self, obj: object) -> object:
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
 class SearchPipeline(BasePipeline):
     """
     Builds and queries a FAISS semantic search index over media analysis results.
@@ -317,12 +330,11 @@ class SearchPipeline(BasePipeline):
         faiss.write_index(self._index, str(output_dir / "index.faiss"))
 
         with open(output_dir / "documents.json", "w") as f:
-            # Strip PIL images from metadata before serialising
             safe_docs = [
                 {k: v for k, v in doc.items() if k != "image"}
                 for doc in self._documents
             ]
-            json.dump(safe_docs, f, indent=2)
+            json.dump(safe_docs, f, indent=2, cls=_NumpyEncoder)
 
         log.info(f"Index saved to {output_dir}")
         return output_dir
