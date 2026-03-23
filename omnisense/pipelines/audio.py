@@ -1,11 +1,7 @@
 """
 Audio transcription pipeline.
-
-Uses OpenAI Whisper (via HuggingFace) to produce:
-  - Full transcript text
-  - Timestamped segments
-  - NLP-ready text chunks
-  - Detected language + confidence
+Uses faster-whisper — CTranslate2 backend, no numba/llvmlite dependency,
+2-4x faster than openai-whisper with identical accuracy.
 """
 
 from __future__ import annotations
@@ -13,8 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import torch
-import whisper
+from faster_whisper import WhisperModel
 
 from omnisense.config import CACHE_DIR, DEVICE, MAX_VIDEO_DURATION, MODELS
 from omnisense.pipelines.base import BasePipeline
@@ -25,86 +20,80 @@ from omnisense.utils.media import (
     get_audio_duration,
 )
 
-# Video file extensions we can handle
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
 
 
 class AudioPipeline(BasePipeline):
     """
-    Transcribes audio/video files using OpenAI Whisper.
-
-    Usage:
-        pipeline = AudioPipeline(device="cpu")
-        result = pipeline("/path/to/file.mp4")
+    Transcribes audio/video files using faster-whisper.
 
     Result shape:
         {
-            "transcript":  str,           # full joined text
-            "segments":    list[dict],    # raw Whisper segments
-            "chunks":      list[dict],    # NLP-ready chunks with timestamps
-            "language":    str,           # detected language code e.g. "en"
-            "duration":    float,         # audio duration in seconds
-            "model":       str,           # model identifier used
+            "transcript":  str,
+            "segments":    list[dict],
+            "chunks":      list[dict],
+            "language":    str,
+            "duration":    float,
+            "model":       str,
         }
     """
 
     def __init__(self, device: str = DEVICE) -> None:
         super().__init__(device=device)
-        self._model: whisper.Whisper | None = None
-        self._model_name = (
-            MODELS["whisper"].split("/")[-1].replace("whisper-", "")
-        )  # "base"
-
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+        self._model: WhisperModel | None = None
+        self._model_size = MODELS["whisper"].split("/")[-1].replace("whisper-", "")
+        self._fw_device = "cuda" if device == "cuda" else "cpu"
 
     def load(self) -> None:
-        """Download and cache Whisper weights."""
-        log.info(f"Loading Whisper model '{self._model_name}'…")
-        self._model = whisper.load_model(
-            self._model_name,
-            device=self._device_for_whisper(),
+        """Download and cache faster-whisper weights."""
+        log.info(f"Loading faster-whisper model '{self._model_size}'…")
+        self._model = WhisperModel(
+            self._model_size,
+            device=self._fw_device,
+            compute_type="int8",
             download_root=str(CACHE_DIR / "whisper"),
         )
-        log.info("Whisper model loaded ✓")
-
-    # ── Core run ──────────────────────────────────────────────────────────────
+        log.info("faster-whisper model loaded ✓")
 
     def run(self, media_path: str | Path) -> dict[str, Any]:
-        """
-        Transcribe an audio or video file.
-
-        Args:
-            media_path: Path to audio (.wav, .mp3, …) or video (.mp4, …).
-
-        Returns:
-            Structured result dict (see class docstring).
-
-        Raises:
-            FileNotFoundError: File does not exist.
-            ValueError: Duration exceeds MAX_VIDEO_DURATION.
-            RuntimeError: Whisper transcription fails.
-        """
+        """Transcribe an audio or video file."""
         media_path = Path(media_path)
         self._validate_file(media_path)
 
-        # If it's a video, extract audio track first
         audio_path = self._resolve_audio(media_path)
 
-        # Guard against runaway files
         duration = get_audio_duration(audio_path)
         if duration > MAX_VIDEO_DURATION:
             raise ValueError(
-                f"File duration {duration:.0f}s exceeds limit "
-                f"of {MAX_VIDEO_DURATION}s. Set MAX_VIDEO_DURATION_SECONDS in .env."
+                f"Duration {duration:.0f}s exceeds limit of {MAX_VIDEO_DURATION}s."
             )
 
         log.info(f"Transcribing {audio_path.name} ({duration:.1f}s)…")
-        raw = self._transcribe(audio_path)
+        segments_raw, info = self._model.transcribe(
+            str(audio_path),
+            beam_size=5,
+            word_timestamps=True,
+        )
 
-        segments: list[dict] = raw.get("segments", [])
-        transcript: str = raw.get("text", "").strip()
-        language: str = raw.get("language", "unknown")
+        segments: list[dict] = []
+        transcript_parts: list[str] = []
+        for seg in segments_raw:
+            segments.append(
+                {
+                    "text": seg.text.strip(),
+                    "start": seg.start,
+                    "end": seg.end,
+                    "words": [
+                        {"word": w.word, "start": w.start, "end": w.end}
+                        for w in (seg.words or [])
+                    ],
+                }
+            )
+            transcript_parts.append(seg.text.strip())
+
+        transcript = " ".join(transcript_parts)
+        language = info.language
         chunks = chunk_transcript(segments)
 
         log.info(
@@ -121,8 +110,6 @@ class AudioPipeline(BasePipeline):
             "model": MODELS["whisper"],
         }
 
-    # ── Private helpers ───────────────────────────────────────────────────────
-
     def _validate_file(self, path: Path) -> None:
         if not path.exists():
             raise FileNotFoundError(f"Media file not found: {path}")
@@ -134,30 +121,6 @@ class AudioPipeline(BasePipeline):
             )
 
     def _resolve_audio(self, path: Path) -> Path:
-        """Return audio path — extract from video if needed."""
         if path.suffix.lower() in VIDEO_EXTENSIONS:
             return extract_audio_from_video(path, output_dir=CACHE_DIR / "audio")
         return path
-
-    def _transcribe(self, audio_path: Path) -> dict:
-        """Run Whisper inference with verbose logging disabled."""
-        if self._model is None:
-            raise RuntimeError("Model not loaded. Call load() first.")
-        try:
-            return self._model.transcribe(
-                str(audio_path),
-                verbose=False,
-                fp16=self.device == "cuda",
-                word_timestamps=True,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"Whisper transcription failed: {exc}") from exc
-
-    def _device_for_whisper(self) -> str:
-        """
-        Whisper uses its own device strings.
-        MPS (Apple Silicon) falls back to CPU — Whisper doesn't support MPS yet.
-        """
-        if self.device == "cuda" and torch.cuda.is_available():
-            return "cuda"
-        return "cpu"
