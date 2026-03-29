@@ -4,23 +4,19 @@ omnisense/app.py
 OmniSense - Temporal Video Search
 Designed to run on HuggingFace Spaces CPU free tier (no GPU required).
 
-Flow:
-  1. User uploads video
-  2. ffmpeg extracts 16kHz mono WAV
-  3. faster-whisper transcribes -> List[TranscriptChunk]
-  4. MiniLM encodes chunks -> FAISS index built
-  5. User queries in natural language
-  6. FAISS returns ranked hits with [start, end] timestamps
-  7. User selects a hit -> JS seeks the video to that timestamp
-
-Import order note:
-  torch is imported first to register OpenMP before ctranslate2 (faster-whisper)
-  loads. On macOS this prevents a segfault. Do not move or remove this import.
+Video seek approach:
+  gr.Video(time=...) not available in all Gradio versions.
+  JS injection causes parse errors in some versions.
+  Solution: show the start timestamp clearly and let the user seek,
+  plus re-serve the video via gr.Video so it is always visible.
+  The timestamp is shown large and bold above the player so the user
+  knows exactly where to scrub to.
 """
 
 from __future__ import annotations
 
-# torch MUST be the first heavy import — registers OpenMP before ctranslate2
+# torch MUST be the first heavy import to register OpenMP before ctranslate2.
+# Prevents segfault on macOS. Do not move this import.
 import torch  # noqa: F401
 
 import tempfile
@@ -62,10 +58,9 @@ def handle_process(
         progress(0.05, desc="Extracting audio track...")
         with tempfile.TemporaryDirectory() as tmpdir:
             audio_path = extract_audio(video_file, output_dir=tmpdir)
-
             progress(
                 0.20,
-                desc=f"Transcribing with Whisper [{model_size}] — please wait...",
+                desc=f"Transcribing with Whisper [{model_size}] -- please wait...",
             )
             _chunks = transcribe(audio_path, model_size=model_size)
 
@@ -99,12 +94,11 @@ def handle_search(
     query: str,
     top_k: int,
     min_score: float,
-) -> tuple[str, gr.update, gr.update]:
+) -> tuple[str, gr.update]:
     if _index is None or not _index.is_ready:
         return (
             "<p style='color:orange;padding:12px'>Process a video first.</p>",
             gr.update(visible=False),
-            gr.update(value=""),
         )
 
     query = query.strip()
@@ -112,7 +106,6 @@ def handle_search(
         return (
             "<p style='color:#888;padding:12px'>Enter a search query above.</p>",
             gr.update(visible=False),
-            gr.update(value=""),
         )
 
     hits = _index.search(query, top_k=int(top_k), min_score=float(min_score))
@@ -126,7 +119,7 @@ def handle_search(
             "Try rephrasing, or lower the Min Similarity slider."
             "</small></div>"
         )
-        return html, gr.update(visible=False), gr.update(value="")
+        return html, gr.update(visible=False)
 
     cards_html = _build_results_html(hits, query)
     radio_choices = [_hit_to_label(h) for h in hits]
@@ -134,28 +127,51 @@ def handle_search(
     return (
         cards_html,
         gr.update(choices=radio_choices, value=None, visible=True),
-        gr.update(value=""),
     )
 
 
-def handle_hit_selected(label: str) -> tuple[gr.update, gr.update, str]:
+def handle_hit_selected(label: str) -> tuple[gr.update, gr.update]:
     """
     User selects a search hit.
-    Returns:
-      - playback_video: show the video file
-      - seek_box: hidden number box with the start time in seconds
-      - seek_js trigger value: timestamp string to fire the JS seek
+    Shows the video player and a prominent seek-to banner
+    telling the user exactly where to scrub.
     """
     if not label or _video_path is None:
-        return gr.update(visible=False), gr.update(value=0), ""
+        return gr.update(visible=False), gr.update(value="")
 
     start_sec = _parse_start_from_label(label)
-    logger.info(f"Seeking to {start_sec}s")
+    start_fmt = _fmt_time(start_sec)
+
+    # Parse end time from label too for display
+    try:
+        end_str = label.split("->")[1].split("]")[0].strip()
+        end_fmt = end_str
+    except Exception:
+        end_fmt = "?"
+
+    logger.info(f"Selected hit: seek to {start_sec}s ({start_fmt})")
+
+    seek_banner = (
+        "<div style='"
+        "background:#1d4ed8;color:#fff;border-radius:10px;"
+        "padding:16px 20px;margin-bottom:12px;text-align:center;"
+        "font-family:system-ui,sans-serif;"
+        "'>"
+        "<div style='font-size:13px;opacity:0.85;margin-bottom:4px'>"
+        "Seek the video below to this timestamp"
+        "</div>"
+        f"<div style='font-size:36px;font-weight:800;letter-spacing:2px'>"
+        f"{start_fmt}"
+        f"</div>"
+        "<div style='font-size:13px;opacity:0.85;margin-top:4px'>"
+        f"Clip runs {start_fmt} to {end_fmt}"
+        "</div>"
+        "</div>"
+    )
 
     return (
         gr.update(value=_video_path, visible=True),
-        gr.update(value=start_sec),
-        str(start_sec),   # triggers the JS seek via Textbox change
+        gr.update(value=seek_banner),
     )
 
 
@@ -169,17 +185,16 @@ def handle_clear() -> tuple:
     _chunks = []
     _video_path = None
     return (
-        None,
-        "base",
-        f"**base** -- {MODEL_SPEED_GUIDE['base']}",
-        "Upload a video and click Transcribe and Index to begin.",
-        gr.update(interactive=False),
-        "",
-        "",
-        gr.update(choices=[], visible=False),
-        gr.update(visible=False),
-        gr.update(value=0),
-        "",
+        None,                                        # video_input
+        "base",                                      # model_choice
+        f"**base** -- {MODEL_SPEED_GUIDE['base']}",  # model_hint
+        "Upload a video and click Transcribe and Index to begin.",  # status_md
+        gr.update(interactive=False),                # search_btn
+        "",                                          # query_box
+        "",                                          # results_html
+        gr.update(choices=[], visible=False),        # hit_selector
+        gr.update(value=""),                         # seek_banner
+        gr.update(visible=False),                    # playback_video
     )
 
 
@@ -225,7 +240,7 @@ def _build_results_html(hits: list[SearchHit], query: str) -> str:
         f"<strong>{len(hits)} result{'s' if len(hits) != 1 else ''}</strong> for "
         f"&ldquo;<em style='color:#2563eb'>{query}</em>&rdquo;"
         "&nbsp;&nbsp;·&nbsp;&nbsp;"
-        "<span style='color:#94a3b8'>select a result below to jump to that moment</span>"
+        "<span style='color:#94a3b8'>select a result below to see the timestamp</span>"
         "</p>"
     )
 
@@ -256,7 +271,7 @@ def _build_results_html(hits: list[SearchHit], query: str) -> str:
             </div>
             <div style="background:#f1f5f9;border-radius:4px;height:5px;margin-bottom:10px">
                 <div style="width:{bar_pct}%;background:{color};height:5px;
-                            border-radius:4px;transition:width 0.3s ease;"></div>
+                            border-radius:4px;"></div>
             </div>
             <p style="margin:0;color:#334155;font-size:14px;line-height:1.65">
                 {h.chunk.text}
@@ -265,27 +280,6 @@ def _build_results_html(hits: list[SearchHit], query: str) -> str:
         """
 
     return header + cards + "</div>"
-
-
-# ── JS for video seek ──────────────────────────────────────────────────────────
-# Gradio does not support gr.Video(time=...) in all versions.
-# Instead we use a hidden Number component to carry the seek time,
-# and a JS snippet wired to its change event to seek the <video> element.
-
-SEEK_JS = """
-(seek_seconds) => {
-    // Find the playback video element — it's the second gr.Video on the page
-    const videos = document.querySelectorAll('video');
-    if (videos.length === 0) return seek_seconds;
-    // Use the last video element (the playback one, not the upload one)
-    const vid = videos[videos.length - 1];
-    if (vid) {
-        vid.currentTime = seek_seconds;
-        vid.play();
-    }
-    return seek_seconds;
-}
-"""
 
 
 # ── Gradio UI ──────────────────────────────────────────────────────────────────
@@ -303,13 +297,13 @@ def build_ui() -> gr.Blocks:
 
         gr.Markdown("""
         # OmniSense - Temporal Video Search
-        **Find exactly *when* something was said in a video. No more scrubbing.**
+        **Find exactly when something was said in a video. No more scrubbing.**
 
         Upload a video, transcribe it, search in plain English,
-        then click a result to jump directly to that moment.
+        then click a result to get the exact timestamp to seek to.
 
-        > Runs fully on CPU · No GPU required
-        > · Powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) + [FAISS](https://github.com/facebookresearch/faiss)
+        > Runs fully on CPU. No GPU required.
+        > Powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) + [FAISS](https://github.com/facebookresearch/faiss)
         """)
 
         with gr.Row(equal_height=False):
@@ -382,18 +376,17 @@ def build_ui() -> gr.Blocks:
 
         hit_selector = gr.Radio(
             choices=[],
-            label="Select a result to jump to that moment in the video",
+            label="Select a result to see its timestamp and video",
             visible=False,
             interactive=True,
         )
 
-        # Hidden number box carries seek time to the JS function
-        seek_time = gr.Number(value=0, visible=False)
-        # Hidden textbox change fires the JS seek trigger
-        seek_trigger = gr.Textbox(value="", visible=False)
+        # Shown when user selects a hit — large timestamp banner
+        seek_banner = gr.HTML(value="", visible=True)
 
+        # Video player — loads file, user scrubs to the timestamp shown above
         playback_video = gr.Video(
-            label="Playback - select a result above to seek here",
+            label="Playback -- scrub to the timestamp shown above",
             visible=False,
             interactive=False,
             height=380,
@@ -428,21 +421,13 @@ def build_ui() -> gr.Blocks:
         search_btn.click(
             fn=handle_search,
             inputs=[query_box, top_k_slider, min_score_slider],
-            outputs=[results_html, hit_selector, seek_trigger],
+            outputs=[results_html, hit_selector],
         )
 
         hit_selector.change(
             fn=handle_hit_selected,
             inputs=[hit_selector],
-            outputs=[playback_video, seek_time, seek_trigger],
-        )
-
-        # JS seek: fires when seek_trigger changes, reads seek_time, seeks video
-        seek_trigger.change(
-            fn=None,
-            inputs=[seek_time],
-            outputs=[seek_time],
-            js=SEEK_JS,
+            outputs=[playback_video, seek_banner],
         )
 
         clear_btn.click(
@@ -457,9 +442,8 @@ def build_ui() -> gr.Blocks:
                 query_box,
                 results_html,
                 hit_selector,
+                seek_banner,
                 playback_video,
-                seek_time,
-                seek_trigger,
             ],
         )
 
