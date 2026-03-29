@@ -245,3 +245,8 @@ logs/*.zip
 # Coverage
 .coverage
 htmlcov/
+assets/ui.png
+assets/sample_audio/sample.aiff
+assets/sample_audio/*.aiff
+assets/sample_videos/*.mp4
+assets/sample_videos/*.mov
