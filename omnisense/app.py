@@ -1,328 +1,314 @@
 """
-OmniSense Gradio Dashboard.
+omnisense/app.py
 
-Single-file interactive UI that chains all four pipelines:
-    Audio → NLP → Vision → Search
+OmniSense — Temporal Video Search
+Designed to run on HuggingFace Spaces CPU free tier (no GPU required).
 
-Users upload a video or audio file, the app runs all pipelines
-in sequence and displays results in a tabbed interface with
-a live semantic search bar at the bottom.
+Flow:
+  1. User uploads video
+  2. ffmpeg extracts 16kHz mono WAV
+  3. faster-whisper transcribes → List[TranscriptChunk]
+  4. MiniLM encodes chunks → FAISS index built
+  5. User queries in natural language
+  6. FAISS returns ranked hits with [start, end] timestamps
+  7. User selects a hit → video seeks and plays from that timestamp
 """
 
 from __future__ import annotations
 
-import traceback
-from pathlib import Path
+import tempfile
 
 import gradio as gr
+from loguru import logger
 
-from omnisense.config import DEVICE
-from omnisense.pipelines.audio import AudioPipeline
-from omnisense.pipelines.nlp import NLPPipeline
-from omnisense.pipelines.search import SearchPipeline
-from omnisense.pipelines.vision import VisionPipeline
-from omnisense.utils.logger import log
+from omnisense.pipelines.audio import (
+    MODEL_SPEED_GUIDE,
+    TranscriptChunk,
+    extract_audio,
+    transcribe,
+)
+from omnisense.pipelines.search import SearchHit, TranscriptSearchIndex
 
-# ── Initialise pipelines once at startup ──────────────────────────────────────
-log.info("Initialising pipelines…")
-audio_pipeline = AudioPipeline(device=DEVICE)
-nlp_pipeline = NLPPipeline(device=DEVICE)
-vision_pipeline = VisionPipeline(device=DEVICE)
-search_pipeline = SearchPipeline(device=DEVICE)
-log.info("All pipelines ready ✓")
+# ── Module-level session state ─────────────────────────────────────────────────
+# Gradio runs each event handler as a function call in the same process,
+# so module-level state is safe for single-user local use and HF Spaces demos.
+# For multi-user production, replace with gr.State() per session.
 
-# ── Global state ──────────────────────────────────────────────────────────────
-_last_results: dict = {}
-
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+_index: TranscriptSearchIndex | None = None
+_chunks: list[TranscriptChunk] = []
+_video_path: str | None = None
 
 
-# ── Main analysis function ────────────────────────────────────────────────────
+# ── Event handlers ─────────────────────────────────────────────────────────────
 
 
-def analyse_media(
-    media_file: str,
+def handle_process(
+    video_file: str | None,
+    model_size: str,
     progress: gr.Progress = gr.Progress(track_tqdm=True),
-) -> tuple:
+) -> tuple[str, gr.update]:
     """
-    Run all four pipelines on the uploaded file.
-    Returns a tuple matching the Gradio output component order.
-    """
-    global _last_results
+    Step 1: User uploads video and clicks Transcribe.
+    Extracts audio, transcribes, builds search index.
 
-    if media_file is None:
-        msg = "⚠️ Please upload a file first."
-        return msg, msg, msg, msg, msg, gr.update(interactive=False)
+    Returns:
+        (status_markdown_string, search_button_update)
+    """
+    global _index, _chunks, _video_path
+
+    if video_file is None:
+        return "⚠️ Please upload a video file first.", gr.update(interactive=False)
+
+    _video_path = video_file
 
     try:
-        media_path = Path(media_file)
-        log.info(f"Starting analysis: {media_path.name}")
+        progress(0.05, desc="Extracting audio track…")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = extract_audio(video_file, output_dir=tmpdir)
 
-        # ── 1. Audio ──────────────────────────────────────────────────────────
-        progress(0.05, desc="🎙 Loading audio model…")
-        log.info("[1/4] Audio pipeline starting…")
-        audio_result = audio_pipeline(media_path)
-        log.info(
-            f"[1/4] Audio done — "
-            f"{len(audio_result['segments'])} segments, "
-            f"language={audio_result['language']}"
-        )
-
-        # ── 2. NLP ────────────────────────────────────────────────────────────
-        progress(0.30, desc="🧠 Running NLP analysis…")
-        log.info("[2/4] NLP pipeline starting…")
-        nlp_result = nlp_pipeline(audio_result)
-        log.info(f"[2/4] NLP done — top topic: {nlp_result['top_topic']}")
-
-        # ── 3. Vision ─────────────────────────────────────────────────────────
-        vision_result = None
-        if media_path.suffix.lower() in VIDEO_EXTENSIONS:
-            progress(0.60, desc="🖼 Analysing video frames…")
-            log.info("[3/4] Vision pipeline starting…")
-            vision_result = vision_pipeline(media_path, max_frames=10)
-            log.info(
-                f"[3/4] Vision done — "
-                f"{vision_result['frame_count']} frames, "
-                f"top label: {vision_result['top_visual_label']}"
+            progress(
+                0.20,
+                desc=(
+                    f"Transcribing with Whisper [{model_size}] — "
+                    f"this takes a few minutes on CPU, please wait…"
+                ),
             )
-        else:
-            log.info("[3/4] Vision skipped — audio-only file")
+            _chunks = transcribe(audio_path, model_size=model_size)
 
-        # ── 4. Search index ───────────────────────────────────────────────────
-        progress(0.85, desc="🔍 Building search index…")
-        log.info("[4/4] Building search index…")
-        search_pipeline.build_index(
-            audio_result=audio_result,
-            nlp_result=nlp_result,
-            vision_result=vision_result,
-        )
-        log.info(
-            f"[4/4] Index built — {search_pipeline.get_stats()['document_count']} docs"
-        )
-
-        _last_results = {
-            "audio": audio_result,
-            "nlp": nlp_result,
-            "vision": vision_result,
-        }
-
-        progress(1.0, desc="✅ Analysis complete!")
-        log.info("Analysis complete ✓")
-
-        return (
-            _format_overview(audio_result, nlp_result, vision_result),
-            _format_transcript(audio_result),
-            _format_nlp(nlp_result),
-            _format_vision(vision_result),
-            _format_search_ready(search_pipeline.get_stats()),
-            gr.update(interactive=True),
-        )
-
-    except Exception:
-        error_detail = traceback.format_exc()
-        log.error(f"Analysis failed:\n{error_detail}")
-        error_md = f"## ❌ Error\n\n```\n{error_detail}\n```"
-        return (
-            error_md,
-            error_md,
-            error_md,
-            error_md,
-            error_md,
-            gr.update(interactive=False),
-        )
-
-
-# ── Search function ───────────────────────────────────────────────────────────
-
-
-def semantic_search(query: str, top_k: int = 5) -> str:
-    """Run semantic search over the last analysis results."""
-    if not query.strip():
-        return "Enter a query above to search."
-
-    if not search_pipeline._index_built:
-        return "⚠️ Run analysis first, then search."
-
-    results = search_pipeline.query(query, top_k=int(top_k))
-
-    if not results:
-        return "No results found."
-
-    lines = [f"### Results for: *{query}*\n"]
-    for i, r in enumerate(results, 1):
-        score_pct = int(r["score"] * 20)
-        score_bar = "█" * max(score_pct, 1)
-        lines.append(
-            f"**{i}. [{r['source'].upper()}]** — "
-            f"score: `{r['score']:.4f}` {score_bar}"
-        )
-        lines.append(f"> {r['text'][:250]}")
-        if r["metadata"]:
-            meta_parts = [
-                f"{k}: {v}"
-                for k, v in r["metadata"].items()
-                if k != "words" and v != ""
-            ]
-            if meta_parts:
-                lines.append(f"*{' | '.join(meta_parts)}*")
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-# ── Output formatters ─────────────────────────────────────────────────────────
-
-
-def _format_overview(
-    audio: dict,
-    nlp: dict,
-    vision: dict | None,
-) -> str:
-    lines = ["## 📊 Analysis Overview\n"]
-    lines.append(f"**Language detected:** {audio.get('language', 'unknown').upper()}")
-    lines.append(f"**Duration:** {audio.get('duration', 0):.1f}s")
-    lines.append(f"**Word count:** {nlp.get('word_count', 0):,}")
-    lines.append(f"**Top topic:** {nlp.get('top_topic', 'unknown').title()}")
-
-    if vision:
-        lines.append(f"**Frames analysed:** {vision.get('frame_count', 0)}")
-        lines.append(
-            f"**Visual scene:** " f"{vision.get('top_visual_label', 'unknown').title()}"
-        )
-        objs = vision.get("unique_objects", [])
-        if objs:
-            lines.append(f"**Objects detected:** {', '.join(objs[:8])}")
-
-    lines.append("\n### Topic Distribution\n")
-    for t in nlp.get("topics", [])[:5]:
-        bar = "█" * max(int(t["score"] * 30), 1)
-        lines.append(f"`{t['label']:<20}` {bar} `{t['score']:.3f}`")
-
-    entities = nlp.get("entities", [])
-    if entities:
-        lines.append("\n### Key Entities\n")
-        for ent in entities[:8]:
-            lines.append(f"- **{ent.get('text', '')}** " f"[{ent.get('label', '')}]")
-
-    return "\n".join(lines)
-
-
-def _format_transcript(audio: dict) -> str:
-    lines = ["## 📝 Transcript\n"]
-    segments = audio.get("segments", [])
-
-    if not segments:
-        text = audio.get("transcript", "No transcript available.")
-        lines.append(text)
-        return "\n".join(lines)
-
-    for seg in segments:
-        start = seg.get("start", 0)
-        mm, ss = divmod(int(start), 60)
-        text = seg.get("text", "").strip()
-        if text:
-            lines.append(f"**[{mm:02d}:{ss:02d}]** {text}")
-
-    lines.append(
-        f"\n---\n*{len(segments)} segments · "
-        f"language: {audio.get('language', '?').upper()}*"
-    )
-    return "\n".join(lines)
-
-
-def _format_nlp(nlp: dict) -> str:
-    lines = ["## 🧠 NLP Analysis\n"]
-
-    lines.append("### Summary\n")
-    lines.append(nlp.get("summary", "No summary available."))
-
-    lines.append("\n### Named Entities\n")
-    entities = nlp.get("entities", [])
-    if entities:
-        for ent in entities[:12]:
-            lines.append(
-                f"- **{ent.get('text', '')}** "
-                f"[{ent.get('label', '')}] "
-                f"— confidence: `{ent.get('score', 0):.2f}`"
+        if not _chunks:
+            return (
+                "⚠️ Transcription returned no segments. "
+                "Check that the video has audible speech.",
+                gr.update(interactive=False),
             )
-    else:
-        lines.append("No entities detected.")
 
-    lines.append("\n### Topic Classification\n")
-    for t in nlp.get("topics", [])[:8]:
-        bar = "█" * max(int(t["score"] * 30), 1)
-        lines.append(f"`{t['label']:<20}` {bar} `{t['score']:.3f}`")
+        progress(0.85, desc="Building semantic search index…")
+        _index = TranscriptSearchIndex()
+        _index.build(_chunks)
 
-    return "\n".join(lines)
+        duration_s = _chunks[-1].end if _chunks else 0
+        m, s = divmod(int(duration_s), 60)
+        status = (
+            f"✅ Ready! Indexed **{len(_chunks)} segments** "
+            f"across **{m}m {s}s** of audio.\n\n"
+            f"Type anything in the search box below to find it."
+        )
+        progress(1.0)
+        return status, gr.update(interactive=True)
+
+    except Exception as e:
+        logger.exception("Error during processing")
+        return f"❌ Error: {e}", gr.update(interactive=False)
 
 
-def _format_vision(vision: dict | None) -> str:
-    if vision is None:
+def handle_search(
+    query: str,
+    top_k: int,
+    min_score: float,
+) -> tuple[str, gr.update]:
+    """
+    Step 2: User submits a search query.
+
+    Returns:
+        (results_html_string, hit_selector_update)
+    """
+    if _index is None or not _index.is_ready:
         return (
-            "## 🖼 Vision Analysis\n\n"
-            "Upload a **video file** to enable vision analysis.\n\n"
-            "*Audio-only files skip this pipeline.*"
+            "<p style='color:orange;padding:12px'>"
+            "⚠️ Process a video first before searching.</p>",
+            gr.update(visible=False),
         )
 
-    lines = ["## 🖼 Vision Analysis\n"]
-    lines.append(f"**Frames processed:** {vision.get('frame_count', 0)}")
-    lines.append(
-        f"**Top visual label:** "
-        f"{vision.get('top_visual_label', 'unknown').title()}\n"
+    query = query.strip()
+    if not query:
+        return (
+            "<p style='color:#888;padding:12px'>Enter a search query above.</p>",
+            gr.update(visible=False),
+        )
+
+    hits = _index.search(query, top_k=int(top_k), min_score=float(min_score))
+
+    if not hits:
+        html = (
+            "<div style='padding:16px;border-radius:8px;"
+            "background:#fff8e1;border:1px solid #ffe082'>"
+            f'<strong>🔍 No matches found</strong> for <em>"{query}"</em><br>'
+            "<small style='color:#666;margin-top:6px;display:block'>"
+            "Try: rephrasing the query · lowering Min Similarity · "
+            "using fewer / different keywords</small></div>"
+        )
+        return html, gr.update(visible=False)
+
+    cards_html = _build_results_html(hits, query)
+    radio_choices = [_hit_to_label(h) for h in hits]
+
+    return cards_html, gr.update(
+        choices=radio_choices,
+        value=None,
+        visible=True,
     )
 
-    lines.append("### Frame Captions\n")
-    for cap in vision.get("captions", [])[:10]:
-        ts = cap.get("timestamp", 0)
-        mm, ss = divmod(int(ts), 60)
-        caption = cap.get("caption", "")
-        if caption and caption != "caption unavailable":
-            lines.append(f"**[{mm:02d}:{ss:02d}]** {caption}")
 
-    lines.append("\n### Detected Objects\n")
-    objs = vision.get("unique_objects", [])
-    if objs:
-        lines.append(", ".join(f"`{o}`" for o in objs))
-    else:
-        lines.append("No objects detected above confidence threshold.")
+def handle_hit_selected(label: str) -> gr.update:
+    """
+    Step 3: User clicks a search result radio button.
+    Seeks the playback video to the hit's start timestamp.
 
-    lines.append("\n### CLIP Scene Classification\n")
-    for c in vision.get("clip_labels", [])[:6]:
-        bar = "█" * max(int(c["score"] * 30), 1)
-        lines.append(f"`{c['label']:<30}` {bar} `{c['score']:.3f}`")
+    Returns:
+        Gradio Video update with value= and time= set.
+    """
+    if not label or _video_path is None:
+        return gr.update(visible=False)
 
-    return "\n".join(lines)
+    start_sec = _parse_start_from_label(label)
+    logger.info(f"Seeking to {start_sec}s")
 
-
-def _format_search_ready(stats: dict) -> str:
-    lines = ["## 🔍 Search Index\n"]
-    status = stats.get("status", "unknown")
-    emoji = "✅" if status == "ready" else "⏳"
-    lines.append(f"**Status:** {emoji} {status.title()}")
-    lines.append(f"**Documents indexed:** {stats.get('document_count', 0):,}")
-    lines.append(f"**Embedding dimensions:** {stats.get('embedding_dim', 384)}")
-
-    sources = stats.get("sources", [])
-    if sources:
-        lines.append("\n**Indexed sources:**")
-        source_descriptions = {
-            "transcript": "Individual transcript segments with timestamps",
-            "transcript_chunk": "Longer transcript chunks for context",
-            "summary": "Full document summary",
-            "chunk_summary": "Per-chunk summaries",
-            "entity": "Named entities (people, orgs, locations)",
-            "caption": "Video frame captions with timestamps",
-            "objects": "Detected objects across all frames",
-        }
-        for src in sorted(sources):
-            desc = source_descriptions.get(src, src)
-            lines.append(f"- **{src}** — {desc}")
-
-    lines.append(
-        "\n*Use the search bar below to query across all sources "
-        "using natural language.*"
+    return gr.update(
+        value=_video_path,
+        visible=True,
+        time=start_sec,  # Gradio 4.x native video seek
     )
-    return "\n".join(lines)
+
+
+def handle_model_change(model_size: str) -> str:
+    """Update the hint text when user changes model selection."""
+    return f"ℹ️ **{model_size}** — {MODEL_SPEED_GUIDE.get(model_size, '')}"
+
+
+def handle_clear() -> tuple:
+    """Reset all state for a fresh start."""
+    global _index, _chunks, _video_path
+    _index = None
+    _chunks = []
+    _video_path = None
+    return (
+        None,  # video_input
+        "base",  # model_choice
+        f"ℹ️ **base** — {MODEL_SPEED_GUIDE['base']}",  # model_hint
+        "👆 Upload a video and click **Transcribe & Index** to begin.",  # status_md
+        gr.update(interactive=False),  # search_btn
+        "",  # query_box
+        "",  # results_html
+        gr.update(choices=[], visible=False),  # hit_selector
+        gr.update(visible=False),  # playback_video
+    )
+
+
+# ── Label helpers ──────────────────────────────────────────────────────────────
+
+
+def _fmt_time(seconds: float) -> str:
+    """Format seconds as M:SS string, e.g. 83.0 → '1:23'."""
+    m, s = divmod(int(seconds), 60)
+    return f"{m}:{s:02d}"
+
+
+def _hit_to_label(hit: SearchHit) -> str:
+    """
+    Encode a SearchHit as a Radio button label string.
+    The start time is embedded so handle_hit_selected can parse it back.
+    Format: '#1  [1:23 → 1:45]  score:72%  —  text preview…'
+    """
+    preview = hit.chunk.text[:100]
+    if len(hit.chunk.text) > 100:
+        preview += "…"
+    return (
+        f"#{hit.rank}  "
+        f"[{_fmt_time(hit.chunk.start)} → {_fmt_time(hit.chunk.end)}]  "
+        f"score:{hit.score:.0%}  —  {preview}"
+    )
+
+
+def _parse_start_from_label(label: str) -> float:
+    """
+    Extract start time in seconds from a hit label string.
+    Parses the '[M:SS → …]' portion.
+    """
+    # label format: "#1  [1:23 → 1:45]  ..."
+    time_str = label.split("[")[1].split("→")[0].strip()  # "1:23"
+    parts = time_str.split(":")
+    return int(parts[0]) * 60 + int(parts[1])
+
+
+# ── Result card HTML ───────────────────────────────────────────────────────────
+
+
+def _build_results_html(hits: list[SearchHit], query: str) -> str:
+    """Render search results as styled HTML cards."""
+
+    def _score_color(score: float) -> str:
+        if score >= 0.60:
+            return "#16a34a"  # green
+        if score >= 0.40:
+            return "#ca8a04"  # amber
+        return "#dc2626"  # red
+
+    header = (
+        f"<div style='font-family:system-ui,-apple-system,sans-serif;padding:2px'>"
+        f"<p style='color:#475569;font-size:14px;margin:0 0 14px 0'>"
+        f"<strong>{len(hits)} result{'s' if len(hits) != 1 else ''}</strong> for "
+        f"&ldquo;<em style='color:#2563eb'>{query}</em>&rdquo;"
+        f"&nbsp;&nbsp;·&nbsp;&nbsp;"
+        f"<span style='color:#94a3b8'>select a result below to jump to that moment ▼</span>"
+        f"</p>"
+    )
+
+    cards = ""
+    for h in hits:
+        color = _score_color(h.score)
+        bar_pct = int(h.score * 100)
+        cards += f"""
+        <div style="
+            border:1px solid #e2e8f0;
+            border-radius:10px;
+            padding:14px 18px;
+            margin-bottom:12px;
+            background:#ffffff;
+            box-shadow:0 1px 3px rgba(0,0,0,0.06);
+        ">
+            <div style="
+                display:flex;
+                justify-content:space-between;
+                align-items:center;
+                margin-bottom:8px;
+            ">
+                <span style="font-weight:700;font-size:15px;color:#1e293b">
+                    #{h.rank}
+                    <span style="
+                        background:#1d4ed8;
+                        color:#fff;
+                        border-radius:5px;
+                        padding:2px 10px;
+                        font-size:13px;
+                        margin-left:8px;
+                        font-weight:600;
+                        letter-spacing:0.2px;
+                    ">
+                        ⏱ {_fmt_time(h.chunk.start)} → {_fmt_time(h.chunk.end)}
+                    </span>
+                </span>
+                <span style="font-size:13px;color:#64748b">
+                    match &nbsp;
+                    <strong style="color:{color};font-size:15px">{h.score:.0%}</strong>
+                </span>
+            </div>
+            <div style="background:#f1f5f9;border-radius:4px;height:5px;margin-bottom:10px">
+                <div style="
+                    width:{bar_pct}%;
+                    background:{color};
+                    height:5px;
+                    border-radius:4px;
+                    transition:width 0.3s ease;
+                "></div>
+            </div>
+            <p style="margin:0;color:#334155;font-size:14px;line-height:1.65">
+                {h.chunk.text}
+            </p>
+        </div>
+        """
+
+    footer = "</div>"
+    return header + cards + footer
 
 
 # ── Gradio UI ──────────────────────────────────────────────────────────────────
@@ -330,164 +316,196 @@ def _format_search_ready(stats: dict) -> str:
 
 def build_ui() -> gr.Blocks:
     with gr.Blocks(
-        title="OmniSense — Multimodal AI Media Analyzer",
-        theme=gr.themes.Soft(),
+        title="OmniSense – Temporal Video Search",
+        theme=gr.themes.Soft(primary_hue="blue"),
         css="""
-            .header { text-align: center; padding: 1.5rem 0 0.5rem; }
-            .header h1 { font-size: 2.2rem; font-weight: 700; margin: 0; }
-            .header p  { color: #666; font-size: 1rem; margin: 0.25rem 0 0; }
+            .gradio-container { max-width: 1080px !important; }
+            #model-radio label span { font-size: 13px !important; }
             footer { display: none !important; }
         """,
     ) as demo:
-        # ── Header ────────────────────────────────────────────────────────────
-        gr.HTML(
+        # ── Header ─────────────────────────────────────────────────────────────
+        gr.Markdown(
             """
-            <div class="header">
-                <h1>🎬 OmniSense</h1>
-                <p>
-                    Multimodal AI Media Analyzer &nbsp;·&nbsp;
-                    Transcription &nbsp;·&nbsp; NLP &nbsp;·&nbsp;
-                    Vision &nbsp;·&nbsp; Semantic Search
-                </p>
-            </div>
+        # 🔍 OmniSense — Temporal Video Search
+        **Find exactly *when* something was said in a video. No more scrubbing.**
+
+        Upload any video → it gets transcribed → search in plain English
+        → click a result → video jumps directly to that moment.
+
+        > 🖥 Runs fully on CPU &nbsp;·&nbsp; No GPU required
+        > &nbsp;·&nbsp; Powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) + [FAISS](https://github.com/facebookresearch/faiss)
         """
         )
 
-        # ── Upload row ────────────────────────────────────────────────────────
-        with gr.Row(equal_height=True):
-            with gr.Column(scale=2):
-                media_input = gr.File(
-                    label="📁 Upload Media File",
-                    file_types=["video", "audio"],
-                    type="filepath",
+        # ── Top row: Upload + Search ────────────────────────────────────────────
+        with gr.Row(equal_height=False):
+            # Left: Upload + model picker
+            with gr.Column(scale=1, min_width=340):
+                gr.Markdown("### 📹 Step 1 — Upload & Transcribe")
+
+                video_input = gr.Video(
+                    label="Upload video",
+                    height=240,
                 )
-                analyse_btn = gr.Button(
-                    "🚀  Analyse",
-                    variant="primary",
-                    size="lg",
+
+                model_choice = gr.Radio(
+                    choices=list(MODEL_SPEED_GUIDE.keys()),
+                    value="base",
+                    label="Whisper model  (speed ↔ accuracy)",
+                    elem_id="model-radio",
                 )
-                gr.Markdown(
-                    "*Supported: MP4, MOV, AVI, MKV, MP3, WAV, M4A, FLAC*",
+                model_hint = gr.Markdown(f"ℹ️ **base** — {MODEL_SPEED_GUIDE['base']}")
+
+                with gr.Row():
+                    process_btn = gr.Button(
+                        "⚡ Transcribe & Index",
+                        variant="primary",
+                        size="lg",
+                    )
+                    clear_btn = gr.Button(
+                        "🗑 Clear",
+                        variant="secondary",
+                        size="lg",
+                    )
+
+                status_md = gr.Markdown(
+                    "👆 Upload a video and click **Transcribe & Index** to begin."
                 )
-            with gr.Column(scale=3):
-                overview_out = gr.Markdown(
-                    value=(
-                        "### Welcome to OmniSense 👋\n\n"
-                        "Upload a video or audio file and click **Analyse** "
-                        "to run the full pipeline:\n\n"
-                        "1. 🎙 **Audio** — Whisper transcription with timestamps\n"
-                        "2. 🧠 **NLP** — Summarisation, NER, topic classification\n"
-                        "3. 🖼 **Vision** — Frame captioning and object detection\n"
-                        "4. 🔍 **Search** — Semantic index over all outputs\n"
+
+            # Right: Search controls
+            with gr.Column(scale=1, min_width=340):
+                gr.Markdown("### 🔎 Step 2 — Search")
+
+                query_box = gr.Textbox(
+                    label="What are you looking for?",
+                    placeholder=(
+                        'e.g.  "climate change"  ·  '
+                        '"when did he mention the budget?"  ·  '
+                        '"machine learning"'
                     ),
+                    lines=3,
                 )
 
-        # ── Results tabs ──────────────────────────────────────────────────────
-        with gr.Tabs():
-            with gr.Tab("📝 Transcript"):
-                transcript_out = gr.Markdown(
-                    value="*Results will appear here after analysis.*"
-                )
-            with gr.Tab("🧠 NLP Analysis"):
-                nlp_out = gr.Markdown(
-                    value="*Results will appear here after analysis.*"
-                )
-            with gr.Tab("🖼 Vision Analysis"):
-                vision_out = gr.Markdown(
-                    value="*Results will appear here after analysis.*"
-                )
-            with gr.Tab("🔍 Search Index"):
-                search_index_out = gr.Markdown(
-                    value="*Results will appear here after analysis.*"
+                with gr.Row():
+                    top_k_slider = gr.Slider(
+                        minimum=1,
+                        maximum=10,
+                        value=5,
+                        step=1,
+                        label="Max results",
+                    )
+                    min_score_slider = gr.Slider(
+                        minimum=0.10,
+                        maximum=0.90,
+                        value=0.30,
+                        step=0.05,
+                        label="Min similarity",
+                    )
+
+                gr.Markdown(
+                    "<small style='color:#94a3b8'>"
+                    "Lower Min Similarity → more results, less precise. "
+                    "Raise it to filter weak matches."
+                    "</small>"
                 )
 
-        # ── Semantic search ───────────────────────────────────────────────────
-        gr.Markdown("---\n## 🔍 Semantic Search")
-        gr.Markdown(
-            "After analysis, search across transcript, summary, "
-            "entities, and captions using natural language."
+                search_btn = gr.Button(
+                    "🔍 Search",
+                    variant="secondary",
+                    size="lg",
+                    interactive=False,  # enabled after transcription
+                )
+
+        # ── Results ─────────────────────────────────────────────────────────────
+        gr.Markdown("---")
+        gr.Markdown("### 📋 Step 3 — Results")
+
+        results_html = gr.HTML(
+            value="<p style='color:#94a3b8;padding:8px'>Results will appear here after you search.</p>"
         )
 
-        with gr.Row():
-            search_input = gr.Textbox(
-                placeholder="e.g. what did the speaker say about technology?",
-                label="Search Query",
-                scale=4,
-                lines=1,
-            )
-            top_k_slider = gr.Slider(
-                minimum=1,
-                maximum=10,
-                value=5,
-                step=1,
-                label="Results (Top K)",
-                scale=1,
-            )
+        hit_selector = gr.Radio(
+            choices=[],
+            label="▶  Select a result to jump to that moment in the video",
+            visible=False,
+            interactive=True,
+        )
 
-        search_btn = gr.Button(
-            "🔍  Search",
-            variant="secondary",
+        # ── Playback ─────────────────────────────────────────────────────────────
+        playback_video = gr.Video(
+            label="▶  Playback — click a result above to seek here",
+            visible=False,
             interactive=False,
-        )
-        search_out = gr.Markdown(value="*Run analysis first, then search.*")
-
-        gr.Examples(
-            examples=[
-                ["what did the speaker talk about?"],
-                ["what objects were detected in the video?"],
-                ["who are the people or organisations mentioned?"],
-                ["describe the visual scenes"],
-                ["what is the main topic or theme?"],
-                ["any technology or science mentioned?"],
-            ],
-            inputs=search_input,
-            label="Example queries",
+            height=380,
         )
 
-        # ── Footer ────────────────────────────────────────────────────────────
+        # ── Footer ────────────────────────────────────────────────────────────────
         gr.Markdown(
-            "---\n"
-            "*Built with 🤗 HuggingFace · "
-            "faster-whisper · BART · BERT-NER · CLIP · BLIP · DETR · FAISS*"
+            """
+        ---
+        <div style='text-align:center;color:#94a3b8;font-size:13px;padding:8px 0'>
+            Built with ❤️ using
+            <a href='https://github.com/SYSTRAN/faster-whisper' style='color:#64748b'>faster-whisper</a> ·
+            <a href='https://github.com/facebookresearch/faiss' style='color:#64748b'>FAISS</a> ·
+            <a href='https://www.gradio.app' style='color:#64748b'>Gradio</a>
+            &nbsp;·&nbsp;
+            <a href='https://github.com/cksajil/omnisense' style='color:#64748b'>Source on GitHub</a>
+        </div>
+        """
         )
 
-        # ── Event wiring ──────────────────────────────────────────────────────
-        analyse_btn.click(
-            fn=analyse_media,
-            inputs=[media_input],
-            outputs=[
-                overview_out,
-                transcript_out,
-                nlp_out,
-                vision_out,
-                search_index_out,
-                search_btn,
-            ],
-            show_progress="full",
+        # ── Event wiring ──────────────────────────────────────────────────────────
+
+        model_choice.change(
+            fn=handle_model_change,
+            inputs=[model_choice],
+            outputs=[model_hint],
+        )
+
+        process_btn.click(
+            fn=handle_process,
+            inputs=[video_input, model_choice],
+            outputs=[status_md, search_btn],
         )
 
         search_btn.click(
-            fn=semantic_search,
-            inputs=[search_input, top_k_slider],
-            outputs=[search_out],
+            fn=handle_search,
+            inputs=[query_box, top_k_slider, min_score_slider],
+            outputs=[results_html, hit_selector],
         )
 
-        search_input.submit(
-            fn=semantic_search,
-            inputs=[search_input, top_k_slider],
-            outputs=[search_out],
+        hit_selector.change(
+            fn=handle_hit_selected,
+            inputs=[hit_selector],
+            outputs=[playback_video],
+        )
+
+        clear_btn.click(
+            fn=handle_clear,
+            inputs=[],
+            outputs=[
+                video_input,
+                model_choice,
+                model_hint,
+                status_md,
+                search_btn,
+                query_box,
+                results_html,
+                hit_selector,
+                playback_video,
+            ],
         )
 
     return demo
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entrypoint ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    demo = build_ui()
-    demo.launch(
-        server_name="0.0.0.0",
+    ui = build_ui()
+    ui.launch(
+        server_name="0.0.0.0",  # needed for HF Spaces / Docker
         server_port=7860,
-        share=False,
         show_error=True,
     )

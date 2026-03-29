@@ -1,46 +1,23 @@
-# Core ML
-torch
-torchvision
-torchaudio
-transformers
-datasets
-huggingface-hub
-accelerate
-sentencepiece
-tokenizers
+# ── Transcription ─────────────────────────────────────────────────────────────
+# faster-whisper: CTranslate2 backend, int8 quantized, CPU-optimized
+# Replaces openai-whisper (much faster on CPU, same accuracy)
+faster-whisper>=1.0.0
 
-# Audio
-openai-whisper
-ffmpeg-python
+# ── Semantic Search ────────────────────────────────────────────────────────────
+sentence-transformers>=3.0.0
+faiss-cpu>=1.8.0
 
-# Vision
-Pillow
-opencv-python-headless
-pytube
+# ── UI ─────────────────────────────────────────────────────────────────────────
+gradio>=4.44.0
 
-# NLP utilities
-spacy
+# ── Audio/Video extraction ─────────────────────────────────────────────────────
+ffmpeg-python>=0.2.0
 
-# Vector search
-faiss-cpu
-sentence-transformers
+# ── Utilities ──────────────────────────────────────────────────────────────────
+numpy>=1.26.0
+python-dotenv>=1.0.0
+loguru>=0.7.0
 
-# API & UI
-fastapi
-uvicorn[standard]
-gradio
-python-multipart
-
-# Dev & testing
-pytest
-pytest-cov
-ruff
-pre-commit
-
-# Utilities
-python-dotenv
-loguru
-tqdm
-numpy
-pandas
-pydantic
+# ── Dev / Testing ──────────────────────────────────────────────────────────────
+pytest>=7.0.0
+ruff>=0.1.0

@@ -1,126 +1,181 @@
 """
-Audio transcription pipeline.
-Uses faster-whisper — CTranslate2 backend, no numba/llvmlite dependency,
-2-4x faster than openai-whisper with identical accuracy.
+omnisense/pipelines/audio.py
+
+Audio pipeline: faster-whisper transcription, CPU-first design.
+Targets HuggingFace Spaces free tier (no GPU assumed).
+
+Key decisions:
+  - faster-whisper (CTranslate2) instead of openai-whisper: 4x faster on CPU
+  - compute_type="int8" on CPU: negligible accuracy loss, big speed gain
+  - beam_size=1 (greedy decode): 2x faster than beam_size=5, ~same quality
+  - vad_filter=True: skips silence → fewer segments, faster indexing
+  - word_timestamps=False: segment-level is sufficient for search use case
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
+import os
+from dataclasses import dataclass
 
+import torch
 from faster_whisper import WhisperModel
+from loguru import logger
 
-from omnisense.config import CACHE_DIR, DEVICE, MAX_VIDEO_DURATION, MODELS
-from omnisense.pipelines.base import BasePipeline
-from omnisense.utils.logger import log
-from omnisense.utils.media import (
-    chunk_transcript,
-    extract_audio_from_video,
-    get_audio_duration,
-)
-
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
-AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
+# ── Data contract shared with search.py and app.py ────────────────────────────
 
 
-class AudioPipeline(BasePipeline):
+@dataclass
+class TranscriptChunk:
     """
-    Transcribes audio/video files using faster-whisper.
-
-    Result shape:
-        {
-            "transcript":  str,
-            "segments":    list[dict],
-            "chunks":      list[dict],
-            "language":    str,
-            "duration":    float,
-            "model":       str,
-        }
+    A single transcribed segment with its time bounds.
+    This is the core data unit passed between all pipeline stages.
     """
 
-    def __init__(self, device: str = DEVICE) -> None:
-        super().__init__(device=device)
-        self._model: WhisperModel | None = None
-        self._model_size = MODELS["whisper"].split("/")[-1].replace("whisper-", "")
-        self._fw_device = "cuda" if device == "cuda" else "cpu"
+    text: str
+    start: float  # seconds from video start
+    end: float  # seconds from video start
+    chunk_id: int = 0
 
-    def load(self) -> None:
-        """Download and cache faster-whisper weights."""
-        log.info(f"Loading faster-whisper model '{self._model_size}'…")
-        self._model = WhisperModel(
-            self._model_size,
-            device=self._fw_device,
-            compute_type="int8",
-            download_root=str(CACHE_DIR / "whisper"),
+
+# ── Hardware detection ─────────────────────────────────────────────────────────
+
+
+def _best_device() -> tuple[str, str]:
+    """
+    Detect available hardware and return (device, compute_type).
+
+    Priority:
+      CUDA GPU  → float16  (fastest, not expected on HF Spaces free tier)
+      CPU       → int8     (best CPU performance via CTranslate2 quantization)
+
+    Note: MPS (Apple Silicon) is intentionally not used here because
+    faster-whisper's CTranslate2 backend does not support MPS.
+    """
+    if torch.cuda.is_available():
+        logger.info("CUDA detected — using float16")
+        return "cuda", "float16"
+    logger.info("No GPU detected — using CPU with int8 quantization")
+    return "cpu", "int8"
+
+
+# ── Audio extraction ───────────────────────────────────────────────────────────
+
+
+def extract_audio(video_path: str, output_dir: str = "/tmp") -> str:
+    """
+    Extract a 16kHz mono WAV audio track from any video file.
+
+    Uses ffmpeg-python. The 16kHz / mono format is what Whisper expects;
+    doing the conversion here (rather than letting Whisper do it internally)
+    gives us a clean cached file we can inspect or reuse.
+
+    Args:
+        video_path:  Path to the uploaded video file.
+        output_dir:  Directory to write the extracted WAV.
+
+    Returns:
+        Path to the extracted WAV file.
+    """
+    import ffmpeg
+
+    audio_path = os.path.join(output_dir, "extracted_audio.wav")
+    logger.info(f"Extracting audio from {video_path} → {audio_path}")
+
+    (
+        ffmpeg.input(video_path)
+        .output(
+            audio_path,
+            ac=1,  # mono
+            ar=16000,  # 16kHz — Whisper's native sample rate
+            format="wav",
         )
-        log.info("faster-whisper model loaded ✓")
+        .overwrite_output()
+        .run(quiet=True)
+    )
 
-    def run(self, media_path: str | Path) -> dict[str, Any]:
-        """Transcribe an audio or video file."""
-        media_path = Path(media_path)
-        self._validate_file(media_path)
+    size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+    logger.info(f"Audio extracted: {size_mb:.1f} MB")
+    return audio_path
 
-        audio_path = self._resolve_audio(media_path)
 
-        duration = get_audio_duration(audio_path)
-        if duration > MAX_VIDEO_DURATION:
-            raise ValueError(
-                f"Duration {duration:.0f}s exceeds limit of {MAX_VIDEO_DURATION}s."
-            )
+# ── Transcription ──────────────────────────────────────────────────────────────
 
-        log.info(f"Transcribing {audio_path.name} ({duration:.1f}s)…")
-        segments_raw, info = self._model.transcribe(
-            str(audio_path),
-            beam_size=5,
-            word_timestamps=True,
+#: Estimated real-time factors on HF Spaces CPU free tier.
+#: e.g. RTF=0.15 means 1 hour of audio takes ~9 minutes to transcribe.
+MODEL_SPEED_GUIDE: dict[str, str] = {
+    "tiny": "~2–4 min per hour of audio   · rough accuracy",
+    "base": "~5–8 min per hour of audio   · good accuracy  ✓ recommended",
+    "small": "~10–15 min per hour of audio · better accuracy",
+    "medium": "~25–35 min per hour of audio · best CPU accuracy",
+}
+
+
+def transcribe(
+    audio_path: str,
+    model_size: str = "base",
+) -> list[TranscriptChunk]:
+    """
+    Transcribe audio and return a list of segment-level TranscriptChunks.
+
+    Each chunk carries the spoken text and its [start, end] time bounds in
+    seconds. These are passed directly to the search pipeline for indexing.
+
+    Args:
+        audio_path:  Path to the extracted .wav file.
+        model_size:  One of "tiny", "base", "small", "medium".
+                     "base" is the recommended default for HF Spaces.
+
+    Returns:
+        List[TranscriptChunk] sorted by start time.
+
+    Raises:
+        FileNotFoundError: If audio_path does not exist.
+        ValueError:        If model_size is not a valid Whisper model name.
+    """
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+    device, compute_type = _best_device()
+
+    logger.info(
+        f"Loading faster-whisper [{model_size}] | "
+        f"device={device} | compute_type={compute_type}"
+    )
+    model = WhisperModel(model_size, device=device, compute_type=compute_type)
+
+    logger.info("Transcribing…")
+    segments_generator, info = model.transcribe(
+        audio_path,
+        word_timestamps=False,  # segment-level sufficient for search
+        vad_filter=True,  # skip silence → cleaner segments
+        vad_parameters={
+            "min_silence_duration_ms": 500,
+            "speech_pad_ms": 200,
+        },
+        beam_size=1,  # greedy decode: 2x faster, negligible accuracy drop
+    )
+
+    logger.info(
+        f"Language detected: {info.language} "
+        f"(confidence {info.language_probability:.0%})"
+    )
+
+    chunks: list[TranscriptChunk] = []
+    for i, seg in enumerate(segments_generator):
+        text = seg.text.strip()
+        if not text:
+            continue
+        chunk = TranscriptChunk(
+            text=text,
+            start=round(seg.start, 2),
+            end=round(seg.end, 2),
+            chunk_id=i,
         )
+        chunks.append(chunk)
+        logger.debug(f"  [{chunk.start:.1f}s → {chunk.end:.1f}s] {chunk.text[:80]}")
 
-        segments: list[dict] = []
-        transcript_parts: list[str] = []
-        for seg in segments_raw:
-            segments.append(
-                {
-                    "text": seg.text.strip(),
-                    "start": seg.start,
-                    "end": seg.end,
-                    "words": [
-                        {"word": w.word, "start": w.start, "end": w.end}
-                        for w in (seg.words or [])
-                    ],
-                }
-            )
-            transcript_parts.append(seg.text.strip())
+    if not chunks:
+        logger.warning("Transcription produced zero segments — check your audio file.")
 
-        transcript = " ".join(transcript_parts)
-        language = info.language
-        chunks = chunk_transcript(segments)
-
-        log.info(
-            f"Transcription complete — {len(segments)} segments, "
-            f"{len(chunks)} chunks, language={language}"
-        )
-
-        return {
-            "transcript": transcript,
-            "segments": segments,
-            "chunks": chunks,
-            "language": language,
-            "duration": duration,
-            "model": MODELS["whisper"],
-        }
-
-    def _validate_file(self, path: Path) -> None:
-        if not path.exists():
-            raise FileNotFoundError(f"Media file not found: {path}")
-        suffix = path.suffix.lower()
-        if suffix not in VIDEO_EXTENSIONS | AUDIO_EXTENSIONS:
-            raise ValueError(
-                f"Unsupported file type '{suffix}'. "
-                f"Supported: {VIDEO_EXTENSIONS | AUDIO_EXTENSIONS}"
-            )
-
-    def _resolve_audio(self, path: Path) -> Path:
-        if path.suffix.lower() in VIDEO_EXTENSIONS:
-            return extract_audio_from_video(path, output_dir=CACHE_DIR / "audio")
-        return path
+    logger.info(f"Transcription complete: {len(chunks)} segments")
+    return chunks

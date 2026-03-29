@@ -1,382 +1,176 @@
 """
-Semantic search pipeline.
+omnisense/pipelines/search.py
 
-Encodes all OmniSense pipeline outputs into a unified FAISS vector store,
-enabling natural language search over transcripts, captions, summaries,
-and named entities from any analysed media file.
+Semantic search over timestamped transcript chunks.
 
-Architecture:
-    1. Collect text chunks from audio, nlp, and vision results
-    2. Encode with Sentence Transformers (all-MiniLM-L6-v2)
-    3. Index with FAISS (flat L2 — exact search, no approximation)
-    4. Query with natural language → top-k most similar chunks
+Stack:
+  - sentence-transformers/all-MiniLM-L6-v2: 80MB, fast on CPU, great quality
+  - FAISS IndexFlatIP: exact cosine search (inner product on normalized vectors)
+    No approximation needed — transcript chunk counts are small (< 10k segments)
+
+Design notes:
+  - TranscriptSearchIndex is stateful: build() once, search() many times.
+  - Cosine similarity via normalized vectors + inner product avoids the need
+    for IndexFlatL2 + manual normalization.
+  - min_score acts as a quality gate: below 0.30 is typically noise.
 """
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import Any
+from dataclasses import dataclass
 
 import faiss
 import numpy as np
+from loguru import logger
 from sentence_transformers import SentenceTransformer
 
-from omnisense.config import CACHE_DIR, DEVICE, MODELS
-from omnisense.pipelines.base import BasePipeline
-from omnisense.utils.logger import log
+from omnisense.pipelines.audio import TranscriptChunk
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# 384-dim embeddings, 80MB model, ~14k sentences/sec on CPU
 
 
-class _NumpyEncoder(json.JSONEncoder):
-    """JSON encoder that handles NumPy scalar types."""
-
-    def default(self, obj: object) -> object:
-        if isinstance(obj, np.integer):
-            return int(obj)
-        if isinstance(obj, np.floating):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return super().default(obj)
+# ── Data types ─────────────────────────────────────────────────────────────────
 
 
-class SearchPipeline(BasePipeline):
+@dataclass
+class SearchHit:
+    """A single search result linking a query to a transcript segment."""
+
+    chunk: TranscriptChunk
+    score: float  # cosine similarity in [0, 1]; higher = more relevant
+    rank: int  # 1-based position in result list
+
+
+# ── Index ──────────────────────────────────────────────────────────────────────
+
+
+class TranscriptSearchIndex:
     """
-    Builds and queries a FAISS semantic search index over media analysis results.
+    FAISS-backed semantic index over TranscriptChunk objects.
 
     Usage:
-        # Build index from pipeline results
-        search = SearchPipeline()
-        search.build_index(audio_result, nlp_result, vision_result)
-
-        # Query in natural language
-        results = search.query("who spoke about technology?", top_k=5)
-
-    Result shape from query():
-        [
-            {
-                "text":       str,    # matched text chunk
-                "source":     str,    # "transcript" | "summary" | "caption" | "entity"
-                "score":      float,  # cosine similarity score (higher = more similar)
-                "metadata":   dict,   # timestamp, frame_id, etc.
-            },
-            ...
-        ]
+        index = TranscriptSearchIndex()
+        index.build(chunks)           # call once after transcription
+        hits = index.search("query")  # call as many times as needed
     """
 
-    def __init__(self, device: str = DEVICE) -> None:
-        super().__init__(device=device)
-        self._encoder: SentenceTransformer | None = None
+    def __init__(self, model_name: str = EMBEDDING_MODEL) -> None:
+        logger.info(f"Loading embedding model: {model_name}")
+        self.model = SentenceTransformer(model_name)
         self._index: faiss.IndexFlatIP | None = None
-        self._documents: list[dict] = []
-        self._index_built = False
-        # SentenceTransformers uses "cuda" or "cpu" directly
-        self._st_device = "cuda" if device == "cuda" else "cpu"
+        self._chunks: list[TranscriptChunk] = []
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+    # ── Build ──────────────────────────────────────────────────────────────────
 
-    def load(self) -> None:
-        """Load the sentence transformer encoder."""
-        log.info(f"Loading encoder: {MODELS['embedder']}")
-        self._encoder = SentenceTransformer(
-            MODELS["embedder"],
-            device=self._st_device,
-            cache_folder=str(CACHE_DIR / "embeddings"),
-        )
-        log.info("Encoder loaded ✓")
-
-    def run(self, query: str, top_k: int = 5) -> list[dict]:
+    def build(self, chunks: list[TranscriptChunk]) -> None:
         """
-        Alias for query() — satisfies BasePipeline interface.
-        Requires build_index() to be called first.
-        """
-        return self.query(query, top_k=top_k)
+        Encode all chunks and build the FAISS index.
 
-    # ── Index building ────────────────────────────────────────────────────────
-
-    def build_index(
-        self,
-        audio_result: dict[str, Any] | None = None,
-        nlp_result: dict[str, Any] | None = None,
-        vision_result: dict[str, Any] | None = None,
-        extra_documents: list[dict] | None = None,
-    ) -> dict[str, Any]:
-        """
-        Build a FAISS index from pipeline outputs.
-
-        Each pipeline result is decomposed into individual text chunks,
-        each tagged with its source and metadata. All chunks are encoded
-        and added to the FAISS index in one batch.
+        This is called once after transcription completes.
+        Subsequent calls replace the existing index.
 
         Args:
-            audio_result:    Output of AudioPipeline.run().
-            nlp_result:      Output of NLPPipeline.run().
-            vision_result:   Output of VisionPipeline.run().
-            extra_documents: Additional custom dicts with 'text' and 'source'.
-
-        Returns:
-            Index stats dict: {document_count, embedding_dim, sources}
-        """
-        if not self._loaded:
-            self.load()
-            self._loaded = True
-
-        documents: list[dict] = []
-
-        # ── Audio — transcript segments ───────────────────────────────────────
-        if audio_result:
-            for seg in audio_result.get("segments", []):
-                text = seg.get("text", "").strip()
-                if text:
-                    documents.append(
-                        {
-                            "text": text,
-                            "source": "transcript",
-                            "metadata": {
-                                "start": seg.get("start", 0),
-                                "end": seg.get("end", 0),
-                            },
-                        }
-                    )
-
-            # Also index the full transcript chunks for broader context
-            for chunk in audio_result.get("chunks", []):
-                text = chunk.get("text", "").strip()
-                if text:
-                    documents.append(
-                        {
-                            "text": text,
-                            "source": "transcript_chunk",
-                            "metadata": {
-                                "start": chunk.get("start", 0),
-                                "end": chunk.get("end", 0),
-                            },
-                        }
-                    )
-
-        # ── NLP — summary + entities ──────────────────────────────────────────
-        if nlp_result:
-            summary = nlp_result.get("summary", "").strip()
-            if summary:
-                documents.append(
-                    {
-                        "text": summary,
-                        "source": "summary",
-                        "metadata": {"top_topic": nlp_result.get("top_topic", "")},
-                    }
-                )
-
-            for chunk_summary in nlp_result.get("chunk_summaries", []):
-                if chunk_summary.strip():
-                    documents.append(
-                        {
-                            "text": chunk_summary.strip(),
-                            "source": "chunk_summary",
-                            "metadata": {},
-                        }
-                    )
-
-            for entity in nlp_result.get("entities", []):
-                text = entity.get("text", "").strip()
-                if text:
-                    documents.append(
-                        {
-                            "text": f"{entity.get('label', '')}: {text}",
-                            "source": "entity",
-                            "metadata": {
-                                "label": entity.get("label", ""),
-                                "score": entity.get("score", 0.0),
-                            },
-                        }
-                    )
-
-        # ── Vision — captions + detected objects ──────────────────────────────
-        if vision_result:
-            for cap in vision_result.get("captions", []):
-                text = cap.get("caption", "").strip()
-                if text and text != "caption unavailable":
-                    documents.append(
-                        {
-                            "text": text,
-                            "source": "caption",
-                            "metadata": {
-                                "frame_id": cap.get("frame_id", 0),
-                                "timestamp": cap.get("timestamp", 0),
-                            },
-                        }
-                    )
-
-            unique_objects = vision_result.get("unique_objects", [])
-            if unique_objects:
-                documents.append(
-                    {
-                        "text": "Objects detected: " + ", ".join(unique_objects),
-                        "source": "objects",
-                        "metadata": {"count": len(unique_objects)},
-                    }
-                )
-
-        # ── Extra documents ───────────────────────────────────────────────────
-        if extra_documents:
-            documents.extend(extra_documents)
-
-        if not documents:
-            log.warning(
-                "No documents to index — build_index() called with empty results"
-            )
-            return {"document_count": 0, "embedding_dim": 0, "sources": []}
-
-        log.info(f"Encoding {len(documents)} documents…")
-        texts = [doc["text"] for doc in documents]
-        embeddings = self._encoder.encode(
-            texts,
-            batch_size=64,
-            show_progress_bar=True,
-            convert_to_numpy=True,
-            normalize_embeddings=True,  # L2 normalise for cosine similarity
-        )
-
-        # FAISS IndexFlatIP = inner product on normalised vectors = cosine similarity
-        dim = embeddings.shape[1]
-        self._index = faiss.IndexFlatIP(dim)
-        self._index.add(embeddings.astype(np.float32))
-        self._documents = documents
-        self._index_built = True
-
-        sources = list(set(doc["source"] for doc in documents))
-        log.info(
-            f"Index built — {len(documents)} docs, " f"dim={dim}, sources={sources}"
-        )
-
-        return {
-            "document_count": len(documents),
-            "embedding_dim": dim,
-            "sources": sources,
-        }
-
-    # ── Querying ──────────────────────────────────────────────────────────────
-
-    def query(self, query_text: str, top_k: int = 5) -> list[dict]:
-        """
-        Search the index with a natural language query.
-
-        Args:
-            query_text: Natural language search query.
-            top_k: Number of results to return.
-
-        Returns:
-            List of result dicts sorted by similarity score descending.
+            chunks: List of TranscriptChunk from the audio pipeline.
 
         Raises:
-            RuntimeError: If build_index() has not been called yet.
+            ValueError: If chunks is empty.
         """
-        if not self._index_built:
-            raise RuntimeError(
-                "Index not built. Call build_index() with pipeline results first."
-            )
+        if not chunks:
+            raise ValueError("Cannot build index from empty chunk list.")
 
-        if not query_text.strip():
-            return []
+        self._chunks = chunks
+        texts = [c.text for c in chunks]
 
-        # Encode and normalise the query
-        query_embedding = self._encoder.encode(
-            [query_text],
+        logger.info(f"Encoding {len(texts)} segments…")
+        embeddings: np.ndarray = self.model.encode(
+            texts,
+            batch_size=64,
+            show_progress_bar=False,
+            normalize_embeddings=True,  # L2-normalize → cosine via inner product
             convert_to_numpy=True,
-            normalize_embeddings=True,
         ).astype(np.float32)
 
-        # Search — returns distances and indices
-        k = min(top_k, len(self._documents))
-        scores, indices = self._index.search(query_embedding, k)
+        dim = embeddings.shape[1]
+        self._index = faiss.IndexFlatIP(dim)  # exact inner product search
+        self._index.add(embeddings)
 
-        results = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx == -1:
-                continue
-            doc = self._documents[idx]
-            results.append(
-                {
-                    "text": doc["text"],
-                    "source": doc["source"],
-                    "score": round(float(score), 4),
-                    "metadata": doc.get("metadata", {}),
-                }
-            )
+        logger.info(f"Index built: {self._index.ntotal} vectors, dim={dim}")
 
-        log.debug(f"Query '{query_text[:50]}' → {len(results)} results")
-        return results
+    # ── Search ─────────────────────────────────────────────────────────────────
 
-    # ── Persistence ───────────────────────────────────────────────────────────
-
-    def save_index(self, output_dir: str | Path) -> Path:
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        min_score: float = 0.30,
+    ) -> list[SearchHit]:
         """
-        Persist the FAISS index and document store to disk.
-
-        Useful for caching results between sessions so you don't
-        re-encode on every run.
+        Find transcript segments semantically matching the query.
 
         Args:
-            output_dir: Directory to write index files.
+            query:      Natural language search string.
+            top_k:      Maximum number of results to return.
+            min_score:  Minimum cosine similarity threshold [0, 1].
+                        0.30 is a generous default that captures paraphrases.
+                        Raise to 0.50+ for stricter, more precise results.
 
         Returns:
-            Path to the saved index directory.
+            List of SearchHit sorted by score descending.
+            Empty list if no segments meet the min_score threshold.
+
+        Raises:
+            RuntimeError: If build() has not been called yet.
         """
-        if not self._index_built:
-            raise RuntimeError("No index to save. Call build_index() first.")
+        if self._index is None:
+            raise RuntimeError("Index not built. Call build() before search().")
 
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        if not query.strip():
+            return []
 
-        faiss.write_index(self._index, str(output_dir / "index.faiss"))
+        # Encode and normalize query
+        q_embedding: np.ndarray = self.model.encode(
+            [query],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        ).astype(np.float32)
 
-        with open(output_dir / "documents.json", "w") as f:
-            safe_docs = [
-                {k: v for k, v in doc.items() if k != "image"}
-                for doc in self._documents
-            ]
-            json.dump(safe_docs, f, indent=2, cls=_NumpyEncoder)
-
-        log.info(f"Index saved to {output_dir}")
-        return output_dir
-
-    def load_index(self, index_dir: str | Path) -> None:
-        """
-        Load a previously saved FAISS index from disk.
-
-        Args:
-            index_dir: Directory containing index.faiss and documents.json.
-        """
-        if not self._loaded:
-            self.load()
-            self._loaded = True
-
-        index_dir = Path(index_dir)
-        index_path = index_dir / "index.faiss"
-        docs_path = index_dir / "documents.json"
-
-        if not index_path.exists() or not docs_path.exists():
-            raise FileNotFoundError(
-                f"Index files not found in {index_dir}. "
-                "Run build_index() and save_index() first."
-            )
-
-        self._index = faiss.read_index(str(index_path))
-
-        with open(docs_path) as f:
-            self._documents = json.load(f)
-
-        self._index_built = True
-        log.info(
-            f"Index loaded from {index_dir} " f"— {len(self._documents)} documents"
+        # FAISS search returns (scores, indices) arrays of shape (1, top_k)
+        scores, indices = self._index.search(
+            q_embedding, min(top_k, self._index.ntotal)
         )
 
-    def get_stats(self) -> dict:
-        """Return current index statistics."""
-        if not self._index_built:
-            return {"status": "not built"}
-        return {
-            "status": "ready",
-            "document_count": len(self._documents),
-            "index_size": self._index.ntotal,
-            "sources": list(set(d["source"] for d in self._documents)),
-        }
+        hits: list[SearchHit] = []
+        for rank, (idx, score) in enumerate(zip(indices[0], scores[0]), start=1):
+            if idx == -1:
+                continue  # FAISS padding for under-filled results
+            similarity = float(score)
+            if similarity < min_score:
+                continue
+            hits.append(
+                SearchHit(
+                    chunk=self._chunks[idx],
+                    score=round(similarity, 4),
+                    rank=rank,
+                )
+            )
+
+        logger.info(
+            f"Search '{query[:60]}' → {len(hits)} hits "
+            f"(min_score={min_score}, top_k={top_k})"
+        )
+        return hits
+
+    # ── Introspection ──────────────────────────────────────────────────────────
+
+    @property
+    def is_ready(self) -> bool:
+        """True if the index has been built and is ready to search."""
+        return self._index is not None and self._index.ntotal > 0
+
+    @property
+    def segment_count(self) -> int:
+        """Number of indexed segments."""
+        return len(self._chunks)
