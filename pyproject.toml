@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omnisense"
-version = "0.1.0"
-description = "Multimodal AI media analyzer using HuggingFace open-source models"
+version = "0.2.0"
+description = "Temporal video search — find exactly when something was said"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
@@ -14,14 +14,8 @@ requires-python = ">=3.10"
 where = ["."]
 include = ["omnisense*"]
 
-[tool.ruff]
-line-length = 88
-target-version = "py310"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "N", "W"]
-ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=omnisense --cov-report=term-missing"
+# removed --cov flags: pytest-cov not in requirements.txt for this branch
+addopts = "-v"

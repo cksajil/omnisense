@@ -84,12 +84,12 @@ class TranscriptSearchIndex:
         self._chunks = chunks
         texts = [c.text for c in chunks]
 
-        logger.info(f"Encoding {len(texts)} segments…")
+        logger.info(f"Encoding {len(texts)} segments...")
         embeddings: np.ndarray = self.model.encode(
             texts,
             batch_size=64,
             show_progress_bar=False,
-            normalize_embeddings=True,  # L2-normalize → cosine via inner product
+            normalize_embeddings=True,  # L2-normalize -> cosine via inner product
             convert_to_numpy=True,
         ).astype(np.float32)
 
@@ -158,7 +158,7 @@ class TranscriptSearchIndex:
             )
 
         logger.info(
-            f"Search '{query[:60]}' → {len(hits)} hits "
+            f"Search '{query[:60]}' -> {len(hits)} hits "
             f"(min_score={min_score}, top_k={top_k})"
         )
         return hits
