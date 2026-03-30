@@ -8,13 +8,11 @@ Input modes:
   1. Paste a YouTube URL  → yt-dlp downloads to a temp .mp4
   2. Upload a video file  → used directly
 
-Video seek approach:
-  gr.Video(time=...) not available in all Gradio versions.
-  JS injection causes parse errors in some versions.
-  Solution: show the start timestamp clearly and let the user seek,
-  plus re-serve the video via gr.Video so it is always visible.
-  The timestamp is shown large and bold above the player so the user
-  knows exactly where to scrub to.
+Updated playback behavior:
+  - When a user selects a search hit, the app extracts that exact video segment
+    into a short preview clip.
+  - The preview clip is embedded directly in the UI and autoplayed once.
+  - This avoids relying on browser seek behavior or Gradio time-based seeking.
 """
 
 from __future__ import annotations
@@ -23,7 +21,12 @@ from __future__ import annotations
 # Prevents segfault on macOS. Do not move this import.
 import torch  # noqa: F401
 
+import base64
+import os
+import shutil
+import subprocess
 import tempfile
+import uuid
 
 import gradio as gr
 from loguru import logger
@@ -43,6 +46,8 @@ from omnisense.utils.download import download_video, is_youtube_url
 _index: TranscriptSearchIndex | None = None
 _chunks: list[TranscriptChunk] = []
 _video_path: str | None = None
+_preview_dir: str = tempfile.mkdtemp(prefix="omnisense_preview_")
+_last_clip_path: str | None = None
 
 
 # ── Event handlers ─────────────────────────────────────────────────────────────
@@ -54,9 +59,10 @@ def handle_process(
     model_size: str,
     progress: gr.Progress = gr.Progress(track_tqdm=True),
 ) -> tuple[str, gr.update]:
-    global _index, _chunks, _video_path
+    global _index, _chunks, _video_path, _last_clip_path
 
     youtube_url = (youtube_url or "").strip()
+    _last_clip_path = None
 
     # Resolve the video source — URL takes priority over upload
     if youtube_url:
@@ -160,45 +166,85 @@ def handle_search(
 def handle_hit_selected(label: str) -> tuple[gr.update, gr.update]:
     """
     User selects a search hit.
-    Shows the video player and a prominent seek-to banner
-    telling the user exactly where to scrub.
+    Extract the selected segment into a short clip and autoplay it once.
     """
     if not label or _video_path is None:
-        return gr.update(visible=False), gr.update(value="")
+        return gr.update(value="", visible=False), gr.update(value="")
 
-    start_sec = _parse_start_from_label(label)
+    start_sec, end_sec = _parse_times_from_label(label)
     start_fmt = _fmt_time(start_sec)
+    end_fmt = _fmt_time(end_sec)
+
+    logger.info(f"Selected hit: clip {start_sec}s -> {end_sec}s")
 
     try:
-        end_str = label.split("->")[1].split("]")[0].strip()
-        end_fmt = end_str
-    except Exception:
-        end_fmt = "?"
+        clip_path = _create_preview_clip(_video_path, start_sec, end_sec)
+        clip_data_url = _video_file_to_data_url(clip_path)
 
-    logger.info(f"Selected hit: seek to {start_sec}s ({start_fmt})")
+        playback_html = f"""
+        <div style="
+            background:#ffffff;
+            border:1px solid #dbeafe;
+            border-radius:12px;
+            padding:16px;
+            box-shadow:0 1px 4px rgba(0,0,0,0.06);
+            font-family:system-ui,-apple-system,sans-serif;
+        ">
+            <div style="
+                background:#1d4ed8;
+                color:#fff;
+                border-radius:10px;
+                padding:14px 18px;
+                margin-bottom:14px;
+                text-align:center;
+            ">
+                <div style="font-size:13px;opacity:0.9;margin-bottom:4px;">
+                    Playing selected segment
+                </div>
+                <div style="font-size:34px;font-weight:800;letter-spacing:1px;">
+                    {start_fmt} → {end_fmt}
+                </div>
+                <div style="font-size:13px;opacity:0.9;margin-top:4px;">
+                    This preview clip starts automatically and plays once.
+                </div>
+            </div>
 
-    seek_banner = (
-        "<div style='"
-        "background:#1d4ed8;color:#fff;border-radius:10px;"
-        "padding:16px 20px;margin-bottom:12px;text-align:center;"
-        "font-family:system-ui,sans-serif;"
-        "'>"
-        "<div style='font-size:13px;opacity:0.85;margin-bottom:4px'>"
-        "Seek the video below to this timestamp"
-        "</div>"
-        f"<div style='font-size:36px;font-weight:800;letter-spacing:2px'>"
-        f"{start_fmt}"
-        f"</div>"
-        "<div style='font-size:13px;opacity:0.85;margin-top:4px'>"
-        f"Clip runs {start_fmt} to {end_fmt}"
-        "</div>"
-        "</div>"
-    )
+            <video
+                controls
+                autoplay
+                playsinline
+                style="width:100%;border-radius:10px;background:#000;"
+            >
+                <source src="{clip_data_url}" type="video/mp4">
+                Your browser does not support the video tag.
+            </video>
+        </div>
+        """
 
-    return (
-        gr.update(value=_video_path, visible=True),
-        gr.update(value=seek_banner),
-    )
+        return (
+            gr.update(value=playback_html, visible=True),
+            gr.update(value=""),
+        )
+
+    except Exception as e:
+        logger.exception("Error while creating preview clip")
+        error_html = f"""
+        <div style="
+            padding:14px 16px;
+            border-radius:10px;
+            background:#fef2f2;
+            border:1px solid #fecaca;
+            color:#991b1b;
+            font-family:system-ui,-apple-system,sans-serif;
+        ">
+            <strong>Could not generate preview clip.</strong><br>
+            <span style="font-size:13px;">{e}</span>
+        </div>
+        """
+        return (
+            gr.update(value=error_html, visible=True),
+            gr.update(value=""),
+        )
 
 
 def handle_model_change(model_size: str) -> str:
@@ -206,10 +252,21 @@ def handle_model_change(model_size: str) -> str:
 
 
 def handle_clear() -> tuple:
-    global _index, _chunks, _video_path
+    global _index, _chunks, _video_path, _last_clip_path, _preview_dir
+
     _index = None
     _chunks = []
     _video_path = None
+    _last_clip_path = None
+
+    try:
+        if os.path.isdir(_preview_dir):
+            shutil.rmtree(_preview_dir, ignore_errors=True)
+    except Exception:
+        logger.exception("Failed to remove preview directory during clear")
+
+    _preview_dir = tempfile.mkdtemp(prefix="omnisense_preview_")
+
     return (
         None,  # video_input
         "",  # youtube_url
@@ -221,8 +278,73 @@ def handle_clear() -> tuple:
         "",  # results_html
         gr.update(choices=[], visible=False),  # hit_selector
         gr.update(value=""),  # seek_banner
-        gr.update(visible=False),  # playback_video
+        gr.update(value="", visible=False),  # playback_html
     )
+
+
+# ── Clip helpers ───────────────────────────────────────────────────────────────
+
+
+def _create_preview_clip(source_path: str, start_sec: float, end_sec: float) -> str:
+    global _last_clip_path, _preview_dir
+
+    if not os.path.isfile(source_path):
+        raise FileNotFoundError(f"Video file not found: {source_path}")
+
+    # Guard against invalid or tiny segments
+    start_sec = max(0.0, float(start_sec))
+    end_sec = max(start_sec + 0.2, float(end_sec))
+    duration = end_sec - start_sec
+
+    clip_name = f"clip_{uuid.uuid4().hex}.mp4"
+    clip_path = os.path.join(_preview_dir, clip_name)
+
+    # Re-encode for reliable browser playback and exact segment extraction
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start_sec:.3f}",
+        "-i",
+        source_path,
+        "-t",
+        f"{duration:.3f}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        clip_path,
+    ]
+
+    logger.info(f"Creating preview clip: {' '.join(cmd)}")
+
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.returncode != 0 or not os.path.isfile(clip_path):
+        raise RuntimeError(
+            "ffmpeg failed to extract the selected segment.\n"
+            f"{result.stderr[-1200:]}"
+        )
+
+    _last_clip_path = clip_path
+    return clip_path
+
+
+def _video_file_to_data_url(video_path: str) -> str:
+    with open(video_path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("utf-8")
+    return f"data:video/mp4;base64,{encoded}"
 
 
 # ── Label / time helpers ───────────────────────────────────────────────────────
@@ -244,10 +366,15 @@ def _hit_to_label(hit: SearchHit) -> str:
     )
 
 
-def _parse_start_from_label(label: str) -> float:
-    time_str = label.split("[")[1].split("->")[0].strip()
-    parts = time_str.split(":")
-    return int(parts[0]) * 60 + int(parts[1])
+def _parse_times_from_label(label: str) -> tuple[float, float]:
+    range_text = label.split("[")[1].split("]")[0]
+    start_str, end_str = [x.strip() for x in range_text.split("->")]
+
+    def _to_seconds(ts: str) -> int:
+        parts = ts.split(":")
+        return int(parts[0]) * 60 + int(parts[1])
+
+    return float(_to_seconds(start_str)), float(_to_seconds(end_str))
 
 
 # ── Result card HTML ───────────────────────────────────────────────────────────
@@ -268,7 +395,7 @@ def _build_results_html(hits: list[SearchHit], query: str) -> str:
         f"<strong>{len(hits)} result{'s' if len(hits) != 1 else ''}</strong> for "
         f"&ldquo;<em style='color:#2563eb'>{query}</em>&rdquo;"
         "&nbsp;&nbsp;·&nbsp;&nbsp;"
-        "<span style='color:#94a3b8'>select a result below to see the timestamp</span>"
+        "<span style='color:#94a3b8'>select a result below to play that exact segment</span>"
         "</p>"
     )
 
@@ -330,7 +457,7 @@ def build_ui() -> gr.Blocks:
         **Find exactly when something was said in a video. No more scrubbing.**
 
         Paste a YouTube URL or upload a video, transcribe it, search in plain English,
-        then click a result to get the exact timestamp to seek to.
+        then click a result to instantly preview that exact segment.
 
         > Runs fully on CPU. No GPU required.
         > Powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) + [FAISS](https://github.com/facebookresearch/faiss)
@@ -424,18 +551,16 @@ def build_ui() -> gr.Blocks:
 
         hit_selector = gr.Radio(
             choices=[],
-            label="Select a result to see its timestamp and video",
+            label="Select a result to generate and play that exact clip",
             visible=False,
             interactive=True,
         )
 
         seek_banner = gr.HTML(value="", visible=True)
 
-        playback_video = gr.Video(
-            label="Playback -- scrub to the timestamp shown above",
+        playback_html = gr.HTML(
+            value="",
             visible=False,
-            interactive=False,
-            height=380,
         )
 
         gr.Markdown(
@@ -475,7 +600,7 @@ def build_ui() -> gr.Blocks:
         hit_selector.change(
             fn=handle_hit_selected,
             inputs=[hit_selector],
-            outputs=[playback_video, seek_banner],
+            outputs=[playback_html, seek_banner],
         )
 
         clear_btn.click(
@@ -492,7 +617,7 @@ def build_ui() -> gr.Blocks:
                 results_html,
                 hit_selector,
                 seek_banner,
-                playback_video,
+                playback_html,
             ],
         )
 
