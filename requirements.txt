@@ -13,11 +13,8 @@ gradio>=4.44.0
 
 # ── Audio/Video extraction ─────────────────────────────────────────────────────
 ffmpeg-python>=0.2.0
-<<<<<<< HEAD
-audioop-lts
-=======
 yt-dlp>=2024.1.0
->>>>>>> bda7b87 (added youtube optioon)
+
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
 numpy>=1.26.0
