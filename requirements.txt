@@ -2,6 +2,7 @@
 # faster-whisper: CTranslate2 backend, int8 quantized, best CPU performance
 # Replaces openai-whisper — same accuracy, 4x faster on CPU
 faster-whisper>=1.0.0
+torch>=2.0.0
 
 # ── Semantic Search ────────────────────────────────────────────────────────────
 sentence-transformers>=3.0.0
@@ -12,7 +13,11 @@ gradio>=4.44.0
 
 # ── Audio/Video extraction ─────────────────────────────────────────────────────
 ffmpeg-python>=0.2.0
+<<<<<<< HEAD
 audioop-lts
+=======
+yt-dlp>=2024.1.0
+>>>>>>> bda7b87 (added youtube optioon)
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
 numpy>=1.26.0

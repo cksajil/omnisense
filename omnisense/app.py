@@ -4,6 +4,10 @@ omnisense/app.py
 OmniSense - Temporal Video Search
 Designed to run on HuggingFace Spaces CPU free tier (no GPU required).
 
+Input modes:
+  1. Paste a YouTube URL  → yt-dlp downloads to a temp .mp4
+  2. Upload a video file  → used directly
+
 Video seek approach:
   gr.Video(time=...) not available in all Gradio versions.
   JS injection causes parse errors in some versions.
@@ -31,6 +35,7 @@ from omnisense.pipelines.audio import (
     transcribe,
 )
 from omnisense.pipelines.search import SearchHit, TranscriptSearchIndex
+from omnisense.utils.download import download_video, is_youtube_url
 
 
 # ── Module-level session state ─────────────────────────────────────────────────
@@ -42,25 +47,47 @@ _video_path: str | None = None
 
 # ── Event handlers ─────────────────────────────────────────────────────────────
 
+
 def handle_process(
     video_file: str | None,
+    youtube_url: str,
     model_size: str,
     progress: gr.Progress = gr.Progress(track_tqdm=True),
 ) -> tuple[str, gr.update]:
     global _index, _chunks, _video_path
 
-    if video_file is None:
-        return "Please upload a video file first.", gr.update(interactive=False)
+    youtube_url = (youtube_url or "").strip()
 
-    _video_path = video_file
+    # Resolve the video source — URL takes priority over upload
+    if youtube_url:
+        if not is_youtube_url(youtube_url):
+            return (
+                "That doesn't look like a valid YouTube URL. "
+                "Expected format: https://www.youtube.com/watch?v=...",
+                gr.update(interactive=False),
+            )
+        try:
+            progress(0.05, desc="Downloading YouTube video...")
+            source_path = download_video(youtube_url)
+        except RuntimeError as e:
+            return f"Download failed: {e}", gr.update(interactive=False)
+    elif video_file is not None:
+        source_path = video_file
+    else:
+        return (
+            "Please paste a YouTube URL or upload a video file first.",
+            gr.update(interactive=False),
+        )
+
+    _video_path = source_path
 
     try:
-        progress(0.05, desc="Extracting audio track...")
+        progress(0.20, desc="Extracting audio track...")
         with tempfile.TemporaryDirectory() as tmpdir:
-            audio_path = extract_audio(video_file, output_dir=tmpdir)
+            audio_path = extract_audio(source_path, output_dir=tmpdir)
             progress(
-                0.20,
-                desc=f"Transcribing with Whisper [{model_size}] -- please wait...",
+                0.40,
+                desc=f"Transcribing with Whisper [{model_size}] — please wait...",
             )
             _chunks = transcribe(audio_path, model_size=model_size)
 
@@ -114,7 +141,7 @@ def handle_search(
         html = (
             "<div style='padding:16px;border-radius:8px;"
             "background:#fff8e1;border:1px solid #ffe082'>"
-            f"<strong>No matches found</strong> for <em>\"{query}\"</em><br>"
+            f'<strong>No matches found</strong> for <em>"{query}"</em><br>'
             "<small style='color:#666;margin-top:6px;display:block'>"
             "Try rephrasing, or lower the Min Similarity slider."
             "</small></div>"
@@ -142,7 +169,6 @@ def handle_hit_selected(label: str) -> tuple[gr.update, gr.update]:
     start_sec = _parse_start_from_label(label)
     start_fmt = _fmt_time(start_sec)
 
-    # Parse end time from label too for display
     try:
         end_str = label.split("->")[1].split("]")[0].strip()
         end_fmt = end_str
@@ -185,20 +211,22 @@ def handle_clear() -> tuple:
     _chunks = []
     _video_path = None
     return (
-        None,                                        # video_input
-        "base",                                      # model_choice
+        None,  # video_input
+        "",  # youtube_url
+        "base",  # model_choice
         f"**base** -- {MODEL_SPEED_GUIDE['base']}",  # model_hint
         "Upload a video and click Transcribe and Index to begin.",  # status_md
-        gr.update(interactive=False),                # search_btn
-        "",                                          # query_box
-        "",                                          # results_html
-        gr.update(choices=[], visible=False),        # hit_selector
-        gr.update(value=""),                         # seek_banner
-        gr.update(visible=False),                    # playback_video
+        gr.update(interactive=False),  # search_btn
+        "",  # query_box
+        "",  # results_html
+        gr.update(choices=[], visible=False),  # hit_selector
+        gr.update(value=""),  # seek_banner
+        gr.update(visible=False),  # playback_video
     )
 
 
 # ── Label / time helpers ───────────────────────────────────────────────────────
+
 
 def _fmt_time(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
@@ -217,13 +245,13 @@ def _hit_to_label(hit: SearchHit) -> str:
 
 
 def _parse_start_from_label(label: str) -> float:
-    # label: "#1  [1:23 -> 1:45]  score:72%  --  ..."
     time_str = label.split("[")[1].split("->")[0].strip()
     parts = time_str.split(":")
     return int(parts[0]) * 60 + int(parts[1])
 
 
 # ── Result card HTML ───────────────────────────────────────────────────────────
+
 
 def _build_results_html(hits: list[SearchHit], query: str) -> str:
 
@@ -284,6 +312,7 @@ def _build_results_html(hits: list[SearchHit], query: str) -> str:
 
 # ── Gradio UI ──────────────────────────────────────────────────────────────────
 
+
 def build_ui() -> gr.Blocks:
     with gr.Blocks(
         title="OmniSense - Temporal Video Search",
@@ -295,23 +324,40 @@ def build_ui() -> gr.Blocks:
         """,
     ) as demo:
 
-        gr.Markdown("""
+        gr.Markdown(
+            """
         # OmniSense - Temporal Video Search
         **Find exactly when something was said in a video. No more scrubbing.**
 
-        Upload a video, transcribe it, search in plain English,
+        Paste a YouTube URL or upload a video, transcribe it, search in plain English,
         then click a result to get the exact timestamp to seek to.
 
         > Runs fully on CPU. No GPU required.
         > Powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) + [FAISS](https://github.com/facebookresearch/faiss)
-        """)
+        """
+        )
 
         with gr.Row(equal_height=False):
 
             with gr.Column(scale=1, min_width=340):
-                gr.Markdown("### Step 1 - Upload and Transcribe")
+                gr.Markdown("### Step 1 - Load a video")
 
-                video_input = gr.Video(label="Upload video", height=240)
+                gr.Markdown("**Option A — paste a YouTube URL**")
+                youtube_url = gr.Textbox(
+                    label="YouTube URL",
+                    placeholder="https://www.youtube.com/watch?v=...",
+                    lines=1,
+                )
+                gr.Markdown(
+                    "<small style='color:#94a3b8'>"
+                    "Paste a URL and click Transcribe — no file upload needed.<br>"
+                    "Note: YouTube download may not work on HF Spaces free tier. "
+                    "If it fails, download the video locally and upload below."
+                    "</small>"
+                )
+
+                gr.Markdown("**Option B — upload a video file**")
+                video_input = gr.Video(label="Upload video", height=200)
 
                 model_choice = gr.Radio(
                     choices=list(MODEL_SPEED_GUIDE.keys()),
@@ -319,20 +365,16 @@ def build_ui() -> gr.Blocks:
                     label="Whisper model (speed vs accuracy)",
                     elem_id="model-radio",
                 )
-                model_hint = gr.Markdown(
-                    f"**base** -- {MODEL_SPEED_GUIDE['base']}"
-                )
+                model_hint = gr.Markdown(f"**base** -- {MODEL_SPEED_GUIDE['base']}")
 
                 with gr.Row():
                     process_btn = gr.Button(
                         "Transcribe and Index", variant="primary", size="lg"
                     )
-                    clear_btn = gr.Button(
-                        "Clear", variant="secondary", size="lg"
-                    )
+                    clear_btn = gr.Button("Clear", variant="secondary", size="lg")
 
                 status_md = gr.Markdown(
-                    "Upload a video and click Transcribe and Index to begin."
+                    "Paste a YouTube URL or upload a video, then click Transcribe and Index."
                 )
 
             with gr.Column(scale=1, min_width=340):
@@ -349,11 +391,17 @@ def build_ui() -> gr.Blocks:
 
                 with gr.Row():
                     top_k_slider = gr.Slider(
-                        minimum=1, maximum=10, value=5, step=1,
+                        minimum=1,
+                        maximum=10,
+                        value=5,
+                        step=1,
                         label="Max results",
                     )
                     min_score_slider = gr.Slider(
-                        minimum=0.10, maximum=0.90, value=0.30, step=0.05,
+                        minimum=0.10,
+                        maximum=0.90,
+                        value=0.30,
+                        step=0.05,
                         label="Min similarity",
                     )
 
@@ -381,10 +429,8 @@ def build_ui() -> gr.Blocks:
             interactive=True,
         )
 
-        # Shown when user selects a hit — large timestamp banner
         seek_banner = gr.HTML(value="", visible=True)
 
-        # Video player — loads file, user scrubs to the timestamp shown above
         playback_video = gr.Video(
             label="Playback -- scrub to the timestamp shown above",
             visible=False,
@@ -392,7 +438,8 @@ def build_ui() -> gr.Blocks:
             height=380,
         )
 
-        gr.Markdown("""
+        gr.Markdown(
+            """
         ---
         <div style='text-align:center;color:#94a3b8;font-size:13px;padding:8px 0'>
             Built with
@@ -402,7 +449,8 @@ def build_ui() -> gr.Blocks:
             &nbsp;·&nbsp;
             <a href='https://github.com/cksajil/omnisense' style='color:#64748b'>Source on GitHub</a>
         </div>
-        """)
+        """
+        )
 
         # ── Event wiring ──────────────────────────────────────────────────────
 
@@ -414,7 +462,7 @@ def build_ui() -> gr.Blocks:
 
         process_btn.click(
             fn=handle_process,
-            inputs=[video_input, model_choice],
+            inputs=[video_input, youtube_url, model_choice],
             outputs=[status_md, search_btn],
         )
 
@@ -435,6 +483,7 @@ def build_ui() -> gr.Blocks:
             inputs=[],
             outputs=[
                 video_input,
+                youtube_url,
                 model_choice,
                 model_hint,
                 status_md,
@@ -458,5 +507,5 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=7860,
         show_error=True,
-        share=True
+        share=True,
     )

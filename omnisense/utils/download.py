@@ -1,26 +1,84 @@
 """
 omnisense/utils/download.py
 
-Optional YouTube/URL video downloader using yt-dlp.
-yt-dlp is NOT in requirements.txt — install separately if needed:
-    pip install yt-dlp
+Download a YouTube video (or any yt-dlp-supported URL) to a local .mp4 file.
+Called by app.py when the user provides a URL instead of uploading a file.
 """
 
 from __future__ import annotations
 
-import subprocess
+import re
 import tempfile
 from pathlib import Path
 
+from loguru import logger
+
+
+def is_youtube_url(url: str) -> bool:
+    """Return True if the string looks like a YouTube or youtu.be URL."""
+    url = url.strip()
+    patterns = [
+        r"^https?://(www\.)?youtube\.com/watch\?.*v=[\w-]+",
+        r"^https?://youtu\.be/[\w-]+",
+        r"^https?://(www\.)?youtube\.com/shorts/[\w-]+",
+    ]
+    return any(re.match(p, url) for p in patterns)
+
 
 def download_video(url: str, output_dir: str | None = None) -> str:
-    out_dir = output_dir or tempfile.mkdtemp()
-    out_path = str(Path(out_dir) / "video.mp4")
+    """
+    Download a video from YouTube (or any yt-dlp-supported URL).
+
+    Args:
+        url:        A YouTube watch/shorts/youtu.be URL.
+        output_dir: Directory to save the downloaded file.
+                    Defaults to a fresh temp directory.
+
+    Returns:
+        Absolute path to the downloaded .mp4 file.
+
+    Raises:
+        RuntimeError: If yt-dlp is not installed or download fails.
+        ValueError:   If the URL is not a recognised YouTube URL.
+    """
     try:
-        subprocess.run(
-            ["yt-dlp", "-f", "mp4", "-o", out_path, url],
-            check=True,
+        import yt_dlp  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "yt-dlp is not installed. " "Run: pip install yt-dlp>=2024.1.0"
         )
-    except FileNotFoundError:
-        raise RuntimeError("yt-dlp not found. Install it with: pip install yt-dlp")
+
+    if not is_youtube_url(url):
+        raise ValueError(
+            f"URL does not look like a YouTube link: {url!r}\n"
+            "Supported formats: youtube.com/watch?v=..., youtu.be/..., youtube.com/shorts/..."
+        )
+
+    out_dir = output_dir or tempfile.mkdtemp()
+    out_path = str(Path(out_dir) / "yt_video.mp4")
+
+    ydl_opts = {
+        "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "outtmpl": out_path,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+    }
+
+    logger.info(f"Downloading YouTube video: {url}")
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = info.get("title", "unknown")
+            duration = info.get("duration", 0)
+            logger.info(f"Downloaded: '{title}' ({duration}s) → {out_path}")
+    except Exception as e:
+        raise RuntimeError(f"yt-dlp download failed: {e}") from e
+
+    if not Path(out_path).exists():
+        raise RuntimeError(
+            f"Download seemed to succeed but file not found at {out_path}. "
+            "yt-dlp may have saved it with a different name."
+        )
+
     return out_path
