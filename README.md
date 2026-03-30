@@ -1,16 +1,3 @@
----
-title: OmniSense Temporal Search
-emoji: 🔍
-colorFrom: blue
-colorTo: indigo
-sdk: gradio
-sdk_version: "4.44.0"
-app_file: omnisense/app.py
-pinned: false
-license: mit
-short_description: Find exactly when something was said in any video
----
-
 # 🔍 OmniSense — Temporal Video Search
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
