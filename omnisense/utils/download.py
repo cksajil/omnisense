@@ -1,7 +1,7 @@
 """
 omnisense/utils/download.py
 
-Download a YouTube video (or any yt-dlp-supported URL) to a local .mp4 file.
+Download a YouTube video (or any yt-dlp-supported URL) to a local .mp4.
 Called by app.py when the user provides a URL instead of uploading a file.
 """
 
@@ -40,7 +40,7 @@ def download_video(
         cookies_file: Path to a Netscape-format cookies.txt file.
                       Required on server deployments where YouTube
                       blocks anonymous requests with a bot-check error.
-                      Export from your browser using an extension such as
+                      Export from your browser using the extension
                       "Get cookies.txt LOCALLY".
 
     Returns:
@@ -54,28 +54,43 @@ def download_video(
         import yt_dlp  # noqa: F401
     except ImportError:
         raise RuntimeError(
-            "yt-dlp is not installed. " "Run: pip install yt-dlp>=2024.1.0"
+            "yt-dlp is not installed. Run: pip install yt-dlp>=2024.1.0"
         )
 
     if not is_youtube_url(url):
         raise ValueError(
             f"URL does not look like a YouTube link: {url!r}\n"
-            "Supported formats: youtube.com/watch?v=..., youtu.be/..., youtube.com/shorts/..."
+            "Supported: youtube.com/watch?v=..., "
+            "youtu.be/..., youtube.com/shorts/..."
         )
 
     out_dir = output_dir or tempfile.mkdtemp()
     out_path = str(Path(out_dir) / "yt_video.mp4")
 
     ydl_opts = {
-        "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        # Prefer best video ≤720p + best audio in any container,
+        # merged to mp4. The loose fallback chain avoids
+        # "format not available" errors when a video lacks mp4/m4a.
+        "format": (
+            "bestvideo[height<=720]+bestaudio"
+            "/best[height<=720]"
+            "/best"
+        ),
+        "merge_output_format": "mp4",
         "outtmpl": out_path,
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        # Android/iOS clients use a different API endpoint that does not
-        # trigger YouTube's server-side bot-detection check. tv_embedded and
-        # web are kept as fallbacks in case the mobile clients are unavailable.
-        "extractor_args": {"youtube": {"player_client": ["android", "ios", "tv_embedded", "web"]}},
+        # Android/iOS clients hit a different API endpoint that does
+        # not trigger YouTube's server-side bot-detection check.
+        # tv_embedded and web are kept as fallbacks.
+        "extractor_args": {
+            "youtube": {
+                "player_client": [
+                    "android", "ios", "tv_embedded", "web"
+                ]
+            }
+        },
     }
 
     if cookies_file and Path(cookies_file).exists():
@@ -88,14 +103,16 @@ def download_video(
             info = ydl.extract_info(url, download=True)
             title = info.get("title", "unknown")
             duration = info.get("duration", 0)
-            logger.info(f"Downloaded: '{title}' ({duration}s) → {out_path}")
+            logger.info(
+                f"Downloaded: '{title}' ({duration}s) → {out_path}"
+            )
     except Exception as e:
         raise RuntimeError(f"yt-dlp download failed: {e}") from e
 
     if not Path(out_path).exists():
         raise RuntimeError(
-            f"Download seemed to succeed but file not found at {out_path}. "
-            "yt-dlp may have saved it with a different name."
+            f"Download seemed to succeed but file not found: {out_path}."
+            " yt-dlp may have saved it with a different name."
         )
 
     return out_path
