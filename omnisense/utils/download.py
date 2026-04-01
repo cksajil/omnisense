@@ -72,6 +72,10 @@ def download_video(
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
+        # Use the TV-embedded player client — it bypasses YouTube's server-side
+        # bot-detection without requiring cookies or a logged-in session.
+        # Falls back to the web client if tv_embedded is unavailable.
+        "extractor_args": {"youtube": {"player_client": ["tv_embedded", "web"]}},
     }
 
     if cookies_file and Path(cookies_file).exists():
