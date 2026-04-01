@@ -46,6 +46,7 @@ _last_clip_path: str | None = None
 def handle_process(
     video_file: str | None,
     youtube_url: str,
+    cookies_file: str | None,
     model_size: str,
     progress: gr.Progress = gr.Progress(track_tqdm=True),
 ) -> tuple[str, gr.update]:
@@ -62,9 +63,14 @@ def handle_process(
             )
         try:
             progress(0.05, desc="Downloading YouTube video...")
-            source_path = download_video(youtube_url)
+            source_path = download_video(
+                youtube_url, cookies_file=cookies_file
+            )
         except RuntimeError as e:
-            return f"Download failed: {e}", gr.update(interactive=False)
+            return (
+                f"Download failed: {e}",
+                gr.update(interactive=False),
+            )
     elif video_file is not None:
         source_path = video_file
     else:
@@ -81,13 +87,16 @@ def handle_process(
             audio_path = extract_audio(source_path, output_dir=tmpdir)
             progress(
                 0.40,
-                desc=f"Transcribing [{model_size}] — this may take a minute...",
+                desc=(
+                    f"Transcribing [{model_size}]"
+                    " — this may take a minute..."
+                ),
             )
             _chunks = transcribe(audio_path, model_size=model_size)
 
         if not _chunks:
             return (
-                "No speech found. Check that the video has audible audio.",
+                "No speech found. Check the video has audible audio.",
                 gr.update(interactive=False),
             )
 
@@ -99,8 +108,8 @@ def handle_process(
         m, s = divmod(int(duration_s), 60)
         progress(1.0)
         return (
-            f"Ready — {len(_chunks)} segments indexed "
-            f"({m}m {s}s). Enter a search query.",
+            f"Ready — {len(_chunks)} segments indexed"
+            f" ({m}m {s}s). Enter a search query.",
             gr.update(interactive=True),
         )
 
@@ -116,7 +125,8 @@ def handle_search(
 ) -> tuple[str, gr.update]:
     if _index is None or not _index.is_ready:
         return (
-            "<p style='color:orange;padding:8px'>Transcribe a video first.</p>",
+            "<p style='color:orange;padding:8px'>"
+            "Transcribe a video first.</p>",
             gr.update(visible=False),
         )
 
@@ -127,7 +137,9 @@ def handle_search(
             gr.update(visible=False),
         )
 
-    hits = _index.search(query, top_k=int(top_k), min_score=float(min_score))
+    hits = _index.search(
+        query, top_k=int(top_k), min_score=float(min_score)
+    )
 
     if not hits:
         return (
@@ -157,14 +169,19 @@ def handle_hit_selected(
 
     try:
         clip_path = _create_preview_clip(_video_path, start_sec, end_sec)
-        return gr.update(value=clip_path, visible=True), gr.update(value="")
+        return (
+            gr.update(value=clip_path, visible=True),
+            gr.update(value=""),
+        )
 
     except Exception as e:
         logger.exception("Error while creating preview clip")
         return (
             gr.update(value=None, visible=False),
             gr.update(
-                value=f"<p style='color:#991b1b'>Preview failed: {e}</p>"
+                value=(
+                    f"<p style='color:#991b1b'>Preview failed: {e}</p>"
+                )
             ),
         )
 
@@ -188,8 +205,9 @@ def handle_clear() -> tuple:
     return (
         None,                                  # video_input
         "",                                    # youtube_url
+        None,                                  # cookies_file
         "base",                                # model_choice
-        "Paste a YouTube URL or upload a video to get started.",  # status_md
+        "Paste a YouTube URL or upload a video to get started.",
         gr.update(interactive=False),          # search_btn
         "",                                    # query_box
         "",                                    # results_html
@@ -252,10 +270,7 @@ def _hit_to_label(hit: SearchHit) -> str:
         preview += "..."
     start = _fmt_time(hit.chunk.start)
     end = _fmt_time(hit.chunk.end)
-    return (
-        f"#{hit.rank}  [{start} → {end}]"
-        f"  {hit.score:.0%}  —  {preview}"
-    )
+    return f"#{hit.rank}  [{start} → {end}]  {hit.score:.0%}  —  {preview}"
 
 
 def _parse_times_from_label(label: str) -> tuple[float, float]:
@@ -281,7 +296,9 @@ def _build_results_html(hits: list[SearchHit], query: str) -> str:
             return "#ca8a04"
         return "#dc2626"
 
-    cards = "<div style='font-family:system-ui,-apple-system,sans-serif'>"
+    cards = (
+        "<div style='font-family:system-ui,-apple-system,sans-serif'>"
+    )
     for h in hits:
         color = _score_color(h.score)
         start = _fmt_time(h.chunk.start)
@@ -291,11 +308,11 @@ def _build_results_html(hits: list[SearchHit], query: str) -> str:
             "padding:12px 16px;margin-bottom:10px;background:#fff;'>"
             "<div style='display:flex;justify-content:space-between;"
             "align-items:center;margin-bottom:6px;'>"
-            "<span style='background:#1d4ed8;color:#fff;border-radius:4px;"
-            f"padding:2px 8px;font-size:12px;font-weight:600;'>"
-            f"{start} – {end}</span>"
-            f"<span style='font-size:13px;color:{color};font-weight:600'>"
-            f"{h.score:.0%} match</span>"
+            "<span style='background:#1d4ed8;color:#fff;"
+            "border-radius:4px;padding:2px 8px;"
+            f"font-size:12px;font-weight:600;'>{start} – {end}</span>"
+            "<span style='font-size:13px;"
+            f"color:{color};font-weight:600'>{h.score:.0%} match</span>"
             "</div>"
             "<p style='margin:0;color:#334155;font-size:14px;"
             f"line-height:1.6'>{h.chunk.text}</p>"
@@ -321,22 +338,44 @@ def build_ui() -> gr.Blocks:
         gr.Markdown(
             "# OmniSense\n"
             "Search any video for exactly when something was said.\n\n"
-            "Paste a YouTube URL **or** upload a video file — "
-            "then transcribe, search, and click a result to jump to that moment."
+            "Paste a YouTube URL **or** upload a video — "
+            "transcribe, search, click a result to jump to that moment."
         )
 
         with gr.Row(equal_height=False):
 
             # ── Left: input + transcribe ───────────────────────────────────
             with gr.Column(scale=1, min_width=300):
+
                 youtube_url = gr.Textbox(
                     label="YouTube URL",
                     placeholder="https://www.youtube.com/watch?v=...",
                     lines=1,
                 )
+
+                with gr.Accordion(
+                    "YouTube authentication (required on servers)",
+                    open=False,
+                ):
+                    gr.Markdown(
+                        "YouTube blocks downloads from server IPs without"
+                        " a logged-in session. To use YouTube URLs on"
+                        " Hugging Face Spaces:\n\n"
+                        "1. Install the **Get cookies.txt LOCALLY**"
+                        " browser extension\n"
+                        "2. Go to youtube.com while logged in\n"
+                        "3. Click the extension and export `cookies.txt`\n"
+                        "4. Upload it here"
+                    )
+                    cookies_file = gr.File(
+                        label="cookies.txt",
+                        file_types=[".txt"],
+                        type="filepath",
+                    )
+
                 gr.Markdown(
                     "<div style='text-align:center;color:#94a3b8;"
-                    "margin:4px 0;font-size:13px'>— or —</div>"
+                    "margin:6px 0;font-size:13px'>— or —</div>"
                 )
                 video_input = gr.Video(label="Upload video", height=180)
 
@@ -414,7 +453,7 @@ def build_ui() -> gr.Blocks:
 
         process_btn.click(
             fn=handle_process,
-            inputs=[video_input, youtube_url, model_choice],
+            inputs=[video_input, youtube_url, cookies_file, model_choice],
             outputs=[status_md, search_btn],
         )
 
@@ -436,6 +475,7 @@ def build_ui() -> gr.Blocks:
             outputs=[
                 video_input,
                 youtube_url,
+                cookies_file,
                 model_choice,
                 status_md,
                 search_btn,
@@ -452,7 +492,7 @@ def build_ui() -> gr.Blocks:
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # HF Spaces sets SPACE_ID automatically — it handles the public URL itself.
+    # HF Spaces sets SPACE_ID automatically — it handles the public URL.
     share = os.environ.get("SPACE_ID") is None
 
     ui = build_ui()
