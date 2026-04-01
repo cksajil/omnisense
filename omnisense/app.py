@@ -2,8 +2,8 @@
 omnisense/app.py
 
 OmniSense - Temporal Video Search
-Upload a video, transcribe it, search in plain English, click a result to
-preview that exact segment.
+Upload a video or paste a YouTube URL, transcribe it, search in plain
+English, click a result to preview that exact segment.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from omnisense.pipelines.audio import (
     transcribe,
 )
 from omnisense.pipelines.search import SearchHit, TranscriptSearchIndex
+from omnisense.utils.download import download_video, is_youtube_url
 
 
 # ── Module-level session state ─────────────────────────────────────────────────
@@ -44,23 +45,44 @@ _last_clip_path: str | None = None
 
 def handle_process(
     video_file: str | None,
+    youtube_url: str,
     model_size: str,
     progress: gr.Progress = gr.Progress(track_tqdm=True),
 ) -> tuple[str, gr.update]:
     global _index, _chunks, _video_path, _last_clip_path
 
     _last_clip_path = None
+    youtube_url = (youtube_url or "").strip()
 
-    if video_file is None:
-        return "Upload a video file first.", gr.update(interactive=False)
+    if youtube_url:
+        if not is_youtube_url(youtube_url):
+            return (
+                "That doesn't look like a valid YouTube URL.",
+                gr.update(interactive=False),
+            )
+        try:
+            progress(0.05, desc="Downloading YouTube video...")
+            source_path = download_video(youtube_url)
+        except RuntimeError as e:
+            return f"Download failed: {e}", gr.update(interactive=False)
+    elif video_file is not None:
+        source_path = video_file
+    else:
+        return (
+            "Paste a YouTube URL or upload a video file first.",
+            gr.update(interactive=False),
+        )
 
-    _video_path = video_file
+    _video_path = source_path
 
     try:
-        progress(0.15, desc="Extracting audio track...")
+        progress(0.20, desc="Extracting audio track...")
         with tempfile.TemporaryDirectory() as tmpdir:
-            audio_path = extract_audio(video_file, output_dir=tmpdir)
-            progress(0.35, desc=f"Transcribing [{model_size}] — this may take a minute...")
+            audio_path = extract_audio(source_path, output_dir=tmpdir)
+            progress(
+                0.40,
+                desc=f"Transcribing [{model_size}] — this may take a minute...",
+            )
             _chunks = transcribe(audio_path, model_size=model_size)
 
         if not _chunks:
@@ -77,7 +99,8 @@ def handle_process(
         m, s = divmod(int(duration_s), 60)
         progress(1.0)
         return (
-            f"Ready — {len(_chunks)} segments indexed ({m}m {s}s). Enter a search query.",
+            f"Ready — {len(_chunks)} segments indexed "
+            f"({m}m {s}s). Enter a search query.",
             gr.update(interactive=True),
         )
 
@@ -108,8 +131,8 @@ def handle_search(
 
     if not hits:
         return (
-            "<div style='padding:12px;border-radius:8px;background:#fff8e1;"
-            "border:1px solid #ffe082'>"
+            "<div style='padding:12px;border-radius:8px;"
+            "background:#fff8e1;border:1px solid #ffe082'>"
             f"No matches for <em>\"{query}\"</em>. "
             "Try rephrasing or lowering Min Similarity.</div>",
             gr.update(visible=False),
@@ -123,7 +146,9 @@ def handle_search(
     )
 
 
-def handle_hit_selected(label: str) -> tuple[gr.update, gr.update]:
+def handle_hit_selected(
+    label: str,
+) -> tuple[gr.update, gr.update]:
     if not label or _video_path is None:
         return gr.update(value=None, visible=False), gr.update(value="")
 
@@ -138,7 +163,9 @@ def handle_hit_selected(label: str) -> tuple[gr.update, gr.update]:
         logger.exception("Error while creating preview clip")
         return (
             gr.update(value=None, visible=False),
-            gr.update(value=f"<p style='color:#991b1b'>Preview failed: {e}</p>"),
+            gr.update(
+                value=f"<p style='color:#991b1b'>Preview failed: {e}</p>"
+            ),
         )
 
 
@@ -159,21 +186,24 @@ def handle_clear() -> tuple:
     _preview_dir = tempfile.mkdtemp(prefix="omnisense_preview_")
 
     return (
-        None,                                   # video_input
-        "base",                                 # model_choice
-        "Upload a video to get started.",       # status_md
-        gr.update(interactive=False),           # search_btn
-        "",                                     # query_box
-        "",                                     # results_html
-        gr.update(choices=[], visible=False),   # hit_selector
-        gr.update(value=None, visible=False),   # playback_video
+        None,                                  # video_input
+        "",                                    # youtube_url
+        "base",                                # model_choice
+        "Paste a YouTube URL or upload a video to get started.",  # status_md
+        gr.update(interactive=False),          # search_btn
+        "",                                    # query_box
+        "",                                    # results_html
+        gr.update(choices=[], visible=False),  # hit_selector
+        gr.update(value=None, visible=False),  # playback_video
     )
 
 
 # ── Clip helpers ───────────────────────────────────────────────────────────────
 
 
-def _create_preview_clip(source_path: str, start_sec: float, end_sec: float) -> str:
+def _create_preview_clip(
+    source_path: str, start_sec: float, end_sec: float
+) -> str:
     global _last_clip_path, _preview_dir
 
     if not os.path.isfile(source_path):
@@ -197,7 +227,9 @@ def _create_preview_clip(source_path: str, start_sec: float, end_sec: float) -> 
         clip_path,
     ]
 
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
 
     if result.returncode != 0 or not os.path.isfile(clip_path):
         raise RuntimeError(f"ffmpeg failed:\n{result.stderr[-1200:]}")
@@ -218,8 +250,10 @@ def _hit_to_label(hit: SearchHit) -> str:
     preview = hit.chunk.text[:80]
     if len(hit.chunk.text) > 80:
         preview += "..."
+    start = _fmt_time(hit.chunk.start)
+    end = _fmt_time(hit.chunk.end)
     return (
-        f"#{hit.rank}  [{_fmt_time(hit.chunk.start)} → {_fmt_time(hit.chunk.end)}]"
+        f"#{hit.rank}  [{start} → {end}]"
         f"  {hit.score:.0%}  —  {preview}"
     )
 
@@ -250,26 +284,23 @@ def _build_results_html(hits: list[SearchHit], query: str) -> str:
     cards = "<div style='font-family:system-ui,-apple-system,sans-serif'>"
     for h in hits:
         color = _score_color(h.score)
-        cards += f"""
-        <div style="border:1px solid #e2e8f0;border-radius:8px;
-                    padding:12px 16px;margin-bottom:10px;background:#fff;">
-            <div style="display:flex;justify-content:space-between;
-                        align-items:center;margin-bottom:6px;">
-                <span style="font-weight:700;color:#1e293b">
-                    <span style="background:#1d4ed8;color:#fff;border-radius:4px;
-                                 padding:2px 8px;font-size:12px;">
-                        {_fmt_time(h.chunk.start)} – {_fmt_time(h.chunk.end)}
-                    </span>
-                </span>
-                <span style="font-size:13px;color:{color};font-weight:600">
-                    {h.score:.0%} match
-                </span>
-            </div>
-            <p style="margin:0;color:#334155;font-size:14px;line-height:1.6">
-                {h.chunk.text}
-            </p>
-        </div>
-        """
+        start = _fmt_time(h.chunk.start)
+        end = _fmt_time(h.chunk.end)
+        cards += (
+            "<div style='border:1px solid #e2e8f0;border-radius:8px;"
+            "padding:12px 16px;margin-bottom:10px;background:#fff;'>"
+            "<div style='display:flex;justify-content:space-between;"
+            "align-items:center;margin-bottom:6px;'>"
+            "<span style='background:#1d4ed8;color:#fff;border-radius:4px;"
+            f"padding:2px 8px;font-size:12px;font-weight:600;'>"
+            f"{start} – {end}</span>"
+            f"<span style='font-size:13px;color:{color};font-weight:600'>"
+            f"{h.score:.0%} match</span>"
+            "</div>"
+            "<p style='margin:0;color:#334155;font-size:14px;"
+            f"line-height:1.6'>{h.chunk.text}</p>"
+            "</div>"
+        )
     cards += "</div>"
     return cards
 
@@ -289,14 +320,25 @@ def build_ui() -> gr.Blocks:
 
         gr.Markdown(
             "# OmniSense\n"
-            "Upload a video, transcribe it, then search for any moment by what was said."
+            "Search any video for exactly when something was said.\n\n"
+            "Paste a YouTube URL **or** upload a video file — "
+            "then transcribe, search, and click a result to jump to that moment."
         )
 
         with gr.Row(equal_height=False):
 
-            # ── Left: upload + transcribe ──────────────────────────────────
+            # ── Left: input + transcribe ───────────────────────────────────
             with gr.Column(scale=1, min_width=300):
-                video_input = gr.Video(label="Video", height=220)
+                youtube_url = gr.Textbox(
+                    label="YouTube URL",
+                    placeholder="https://www.youtube.com/watch?v=...",
+                    lines=1,
+                )
+                gr.Markdown(
+                    "<div style='text-align:center;color:#94a3b8;"
+                    "margin:4px 0;font-size:13px'>— or —</div>"
+                )
+                video_input = gr.Video(label="Upload video", height=180)
 
                 model_choice = gr.Radio(
                     choices=list(MODEL_SPEED_GUIDE.keys()),
@@ -305,34 +347,52 @@ def build_ui() -> gr.Blocks:
                 )
 
                 with gr.Row():
-                    process_btn = gr.Button("Transcribe", variant="primary")
+                    process_btn = gr.Button(
+                        "Transcribe", variant="primary"
+                    )
                     clear_btn = gr.Button("Clear", variant="secondary")
 
-                status_md = gr.Markdown("Upload a video to get started.")
+                status_md = gr.Markdown(
+                    "Paste a YouTube URL or upload a video to get started."
+                )
 
             # ── Right: search ──────────────────────────────────────────────
             with gr.Column(scale=1, min_width=300):
                 query_box = gr.Textbox(
                     label="Search",
-                    placeholder='e.g. "climate change" or "budget announcement"',
+                    placeholder=(
+                        'e.g. "climate change" or "budget announcement"'
+                    ),
                     lines=2,
                 )
 
                 with gr.Row():
                     top_k_slider = gr.Slider(
-                        minimum=1, maximum=10, value=5, step=1, label="Max results"
+                        minimum=1,
+                        maximum=10,
+                        value=5,
+                        step=1,
+                        label="Max results",
                     )
                     min_score_slider = gr.Slider(
-                        minimum=0.10, maximum=0.90, value=0.30, step=0.05,
-                        label="Min similarity"
+                        minimum=0.10,
+                        maximum=0.90,
+                        value=0.30,
+                        step=0.05,
+                        label="Min similarity",
                     )
 
-                search_btn = gr.Button("Search", variant="primary", interactive=False)
+                search_btn = gr.Button(
+                    "Search", variant="primary", interactive=False
+                )
 
         gr.Markdown("---")
 
         results_html = gr.HTML(
-            value="<p style='color:#94a3b8'>Search results will appear here.</p>"
+            value=(
+                "<p style='color:#94a3b8'>"
+                "Search results will appear here.</p>"
+            )
         )
 
         hit_selector = gr.Radio(
@@ -354,7 +414,7 @@ def build_ui() -> gr.Blocks:
 
         process_btn.click(
             fn=handle_process,
-            inputs=[video_input, model_choice],
+            inputs=[video_input, youtube_url, model_choice],
             outputs=[status_md, search_btn],
         )
 
@@ -375,6 +435,7 @@ def build_ui() -> gr.Blocks:
             inputs=[],
             outputs=[
                 video_input,
+                youtube_url,
                 model_choice,
                 status_md,
                 search_btn,
