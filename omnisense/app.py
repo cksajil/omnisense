@@ -21,7 +21,6 @@ from __future__ import annotations
 # Prevents segfault on macOS. Do not move this import.
 import torch  # noqa: F401
 
-import base64
 import os
 import shutil
 import subprocess
@@ -167,10 +166,11 @@ def handle_search(
 def handle_hit_selected(label: str) -> tuple[gr.update, gr.update]:
     """
     User selects a search hit.
-    Extract the selected segment into a short clip and autoplay it once.
+    Extract the selected segment into a short clip and return the path so
+    Gradio's Video component can serve and autoplay it.
     """
     if not label or _video_path is None:
-        return gr.update(value="", visible=False), gr.update(value="")
+        return gr.update(value=None, visible=False), gr.update(value="")
 
     start_sec, end_sec = _parse_times_from_label(label)
     start_fmt = _fmt_time(start_sec)
@@ -180,71 +180,24 @@ def handle_hit_selected(label: str) -> tuple[gr.update, gr.update]:
 
     try:
         clip_path = _create_preview_clip(_video_path, start_sec, end_sec)
-        clip_data_url = _video_file_to_data_url(clip_path)
-
-        playback_html = f"""
-        <div style="
-            background:#ffffff;
-            border:1px solid #dbeafe;
-            border-radius:12px;
-            padding:16px;
-            box-shadow:0 1px 4px rgba(0,0,0,0.06);
-            font-family:system-ui,-apple-system,sans-serif;
-        ">
-            <div style="
-                background:#1d4ed8;
-                color:#fff;
-                border-radius:10px;
-                padding:14px 18px;
-                margin-bottom:14px;
-                text-align:center;
-            ">
-                <div style="font-size:13px;opacity:0.9;margin-bottom:4px;">
-                    Playing selected segment
-                </div>
-                <div style="font-size:34px;font-weight:800;letter-spacing:1px;">
-                    {start_fmt} → {end_fmt}
-                </div>
-                <div style="font-size:13px;opacity:0.9;margin-top:4px;">
-                    This preview clip starts automatically and plays once.
-                </div>
-            </div>
-
-            <video
-                controls
-                autoplay
-                playsinline
-                style="width:100%;border-radius:10px;background:#000;"
-            >
-                <source src="{clip_data_url}" type="video/mp4">
-                Your browser does not support the video tag.
-            </video>
-        </div>
-        """
 
         return (
-            gr.update(value=playback_html, visible=True),
-            gr.update(value=""),
+            gr.update(value=clip_path, visible=True),
+            gr.update(
+                value=f"<p style='text-align:center;color:#1d4ed8;"
+                      f"font-weight:600;margin:4px 0'>"
+                      f"Playing segment: {start_fmt} → {end_fmt}</p>"
+            ),
         )
 
     except Exception as e:
         logger.exception("Error while creating preview clip")
-        error_html = f"""
-        <div style="
-            padding:14px 16px;
-            border-radius:10px;
-            background:#fef2f2;
-            border:1px solid #fecaca;
-            color:#991b1b;
-            font-family:system-ui,-apple-system,sans-serif;
-        ">
-            <strong>Could not generate preview clip.</strong><br>
-            <span style="font-size:13px;">{e}</span>
-        </div>
-        """
         return (
-            gr.update(value=error_html, visible=True),
-            gr.update(value=""),
+            gr.update(value=None, visible=False),
+            gr.update(
+                value=f"<p style='color:#991b1b'>"
+                      f"<strong>Preview failed:</strong> {e}</p>"
+            ),
         )
 
 
@@ -280,7 +233,7 @@ def handle_clear() -> tuple:
         "",  # results_html
         gr.update(choices=[], visible=False),  # hit_selector
         gr.update(value=""),  # seek_banner
-        gr.update(value="", visible=False),  # playback_html
+        gr.update(value=None, visible=False),  # playback_video
     )
 
 
@@ -341,12 +294,6 @@ def _create_preview_clip(source_path: str, start_sec: float, end_sec: float) -> 
 
     _last_clip_path = clip_path
     return clip_path
-
-
-def _video_file_to_data_url(video_path: str) -> str:
-    with open(video_path, "rb") as f:
-        encoded = base64.b64encode(f.read()).decode("utf-8")
-    return f"data:video/mp4;base64,{encoded}"
 
 
 # ── Label / time helpers ───────────────────────────────────────────────────────
@@ -567,9 +514,10 @@ def build_ui() -> gr.Blocks:
 
         seek_banner = gr.HTML(value="", visible=True)
 
-        playback_html = gr.HTML(
-            value="",
+        playback_video = gr.Video(
+            label="Clip preview",
             visible=False,
+            autoplay=True,
         )
 
         gr.Markdown(
@@ -609,7 +557,7 @@ def build_ui() -> gr.Blocks:
         hit_selector.change(
             fn=handle_hit_selected,
             inputs=[hit_selector],
-            outputs=[playback_html, seek_banner],
+            outputs=[playback_video, seek_banner],
         )
 
         clear_btn.click(
@@ -627,7 +575,7 @@ def build_ui() -> gr.Blocks:
                 results_html,
                 hit_selector,
                 seek_banner,
-                playback_html,
+                playback_video,
             ],
         )
 
