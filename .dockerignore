@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.git/
+.env
+logs/
+assets/sample_videos/
+assets/sample_audio/
+notebooks/
+*.egg-info/
+dist/
+build/

@@ -627,10 +627,16 @@ def build_ui() -> gr.Blocks:
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import os
+
+    # HF Spaces sets SPACE_ID automatically — it handles the public URL itself,
+    # so share=True would redundantly try to tunnel through Gradio's servers.
+    share = os.environ.get("SPACE_ID") is None
+
     ui = build_ui()
     ui.launch(
         server_name="0.0.0.0",
         server_port=7860,
         show_error=True,
-        share=True,
+        share=share,
     )
