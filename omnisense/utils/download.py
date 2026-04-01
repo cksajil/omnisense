@@ -25,14 +25,23 @@ def is_youtube_url(url: str) -> bool:
     return any(re.match(p, url) for p in patterns)
 
 
-def download_video(url: str, output_dir: str | None = None) -> str:
+def download_video(
+    url: str,
+    output_dir: str | None = None,
+    cookies_file: str | None = None,
+) -> str:
     """
     Download a video from YouTube (or any yt-dlp-supported URL).
 
     Args:
-        url:        A YouTube watch/shorts/youtu.be URL.
-        output_dir: Directory to save the downloaded file.
-                    Defaults to a fresh temp directory.
+        url:          A YouTube watch/shorts/youtu.be URL.
+        output_dir:   Directory to save the downloaded file.
+                      Defaults to a fresh temp directory.
+        cookies_file: Path to a Netscape-format cookies.txt file.
+                      Required on server deployments where YouTube
+                      blocks anonymous requests with a bot-check error.
+                      Export from your browser using an extension such as
+                      "Get cookies.txt LOCALLY".
 
     Returns:
         Absolute path to the downloaded .mp4 file.
@@ -64,6 +73,10 @@ def download_video(url: str, output_dir: str | None = None) -> str:
         "no_warnings": True,
         "noprogress": True,
     }
+
+    if cookies_file and Path(cookies_file).exists():
+        ydl_opts["cookiefile"] = cookies_file
+        logger.info(f"Using cookies file: {cookies_file}")
 
     logger.info(f"Downloading YouTube video: {url}")
     try:

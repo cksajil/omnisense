@@ -56,6 +56,7 @@ _last_clip_path: str | None = None
 def handle_process(
     video_file: str | None,
     youtube_url: str,
+    cookies_file: str | None,
     model_size: str,
     progress: gr.Progress = gr.Progress(track_tqdm=True),
 ) -> tuple[str, gr.update]:
@@ -74,7 +75,7 @@ def handle_process(
             )
         try:
             progress(0.05, desc="Downloading YouTube video...")
-            source_path = download_video(youtube_url)
+            source_path = download_video(youtube_url, cookies_file=cookies_file)
         except RuntimeError as e:
             return f"Download failed: {e}", gr.update(interactive=False)
     elif video_file is not None:
@@ -270,6 +271,7 @@ def handle_clear() -> tuple:
     return (
         None,  # video_input
         "",  # youtube_url
+        None,  # cookies_upload
         "base",  # model_choice
         f"**base** -- {MODEL_SPEED_GUIDE['base']}",  # model_hint
         "Upload a video and click Transcribe and Index to begin.",  # status_md
@@ -478,9 +480,16 @@ def build_ui() -> gr.Blocks:
                 gr.Markdown(
                     "<small style='color:#94a3b8'>"
                     "Paste a URL and click Transcribe — no file upload needed.<br>"
-                    "Note: YouTube download may not work on HF Spaces free tier. "
-                    "If it fails, download the video locally and upload below."
+                    "On hosted deployments YouTube may require cookies to bypass "
+                    "bot-detection. Export <code>cookies.txt</code> from your browser "
+                    "using the <em>Get cookies.txt LOCALLY</em> extension and upload "
+                    "it below."
                     "</small>"
+                )
+                cookies_upload = gr.File(
+                    label="YouTube cookies.txt (optional — only needed on servers)",
+                    file_types=[".txt"],
+                    type="filepath",
                 )
 
                 gr.Markdown("**Option B — upload a video file**")
@@ -587,7 +596,7 @@ def build_ui() -> gr.Blocks:
 
         process_btn.click(
             fn=handle_process,
-            inputs=[video_input, youtube_url, model_choice],
+            inputs=[video_input, youtube_url, cookies_upload, model_choice],
             outputs=[status_md, search_btn],
         )
 
@@ -609,6 +618,7 @@ def build_ui() -> gr.Blocks:
             outputs=[
                 video_input,
                 youtube_url,
+                cookies_upload,
                 model_choice,
                 model_hint,
                 status_md,
