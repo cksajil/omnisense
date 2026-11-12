@@ -1,7 +1,6 @@
 # 🔍 OmniSense — Temporal Video Search
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![HuggingFace Spaces](https://img.shields.io/badge/🤗-Live%20Demo-yellow)](https://huggingface.co/spaces/sajilck/omnisense)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 > **Find exactly *when* something was said in a video. No more scrubbing.**
